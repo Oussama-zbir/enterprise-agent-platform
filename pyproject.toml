@@ -9,7 +9,7 @@ description = "Production-oriented enterprise agent platform (foundation)."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-authors = [{ name = "zbir35", email = "zbir35@gmail.com" }]
+authors = [{ name = "Oussama Zbir", email = "oussamazbirpro@gmail.com" }]
 keywords = ["agentic-ai", "fastapi", "mcp", "llm", "production-ai"]
 dependencies = [
     "fastapi>=0.115",

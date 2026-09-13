@@ -2,11 +2,12 @@
 
 A production-oriented platform for building and operating enterprise AI agents.
 
-> **Status: foundation.** This repository is being built incrementally. Today it
-> establishes the engineering foundation — service skeleton, configuration,
-> structured logging, testing, typing, linting, containerization, and CI.
-> Agent orchestration, tool calling, MCP integration, human-in-the-loop
-> approval, and evaluation are planned milestones (see [Roadmap](#roadmap)).
+> **Status: core domain.** This repository is being built incrementally. It has
+> an engineering foundation (config, structured logging, strict typing, tests,
+> Docker, CI) and a task domain: an explicit agent-task lifecycle, a storage
+> port with optimistic concurrency, and a `/tasks` API. Agent orchestration,
+> tool calling, MCP integration, human-in-the-loop approval, and evaluation are
+> planned milestones (see [Roadmap](#roadmap)).
 
 ## Problem statement
 
@@ -26,10 +27,18 @@ agent capabilities on top without disturbing the operational base.
                 +--------------------------------------------------+
                 |                 FastAPI service                  |
                 |                                                  |
-  HTTP  ----->  |  routes  -->  agent orchestration (later)        |
-                |                 |                                |
-                |                 +--> tool calling / MCP (later)  |
-                |                 +--> human-in-the-loop (later)   |
+  HTTP  ----->  |  /tasks router                                   |
+                |      |                                           |
+                |      v                                           |
+                |  task service  -->  TaskRepository (port)        |
+                |      |                  +--> in-memory adapter   |
+                |      |                  +--> database (later)    |
+                |      v                                           |
+                |  AgentTask state machine                         |
+                |      ^                                           |
+                |      +-- agent orchestration (later)             |
+                |            +--> tool calling / MCP (later)       |
+                |            +--> human-in-the-loop (later)        |
                 |                                                  |
                 |  cross-cutting: config · structured logging ·   |
                 |  evaluation & observability (later)              |
@@ -42,7 +51,25 @@ Current modules:
 | -------------------------------------- | ----------------------------------------------- |
 | `enterprise_agent_platform.config`     | Environment-based settings (Pydantic Settings)  |
 | `enterprise_agent_platform.logging`    | Structured JSON logging to stdout               |
-| `enterprise_agent_platform.main`       | App factory, lifespan, `/health` endpoint       |
+| `enterprise_agent_platform.main`       | App factory, lifespan, `/health`, router wiring |
+| `...tasks.models`                      | `AgentTask` model and lifecycle state machine   |
+| `...tasks.repository`                  | `TaskRepository` port + in-memory adapter       |
+| `...tasks.service`                     | Load → transition → persist use case            |
+| `...tasks.router`                      | `/tasks` HTTP routes and API schemas            |
+
+### Task lifecycle
+
+```
+pending ──> running ──> completed
+   │           │  ├───> failed
+   │           │  └───> awaiting_approval ──> running   (approved)
+   │           │               │
+   └───────────┴───────────────┴──> cancelled           (cancel / rejected)
+```
+
+`completed`, `failed`, and `cancelled` are terminal. The allowed transitions
+live in one table (`ALLOWED_TRANSITIONS`), so the API, the future orchestrator,
+and the approval workflow cannot disagree about what is legal.
 
 ## Design decisions
 
@@ -58,6 +85,25 @@ Current modules:
   tests, and to catch packaging mistakes early.
 - **Strict typing and linting from day one** so quality is enforced by CI
   before the codebase grows.
+- **Explicit state machine over free-form status updates.** Agent tasks will be
+  driven by several actors (orchestrator, human approvers, API clients). A
+  single transition table rejects impossible states such as completing a task
+  that never ran, and each change is appended to an audit history.
+- **Immutable tasks with versioning.** Transitions return a new `AgentTask`
+  with `version + 1` rather than mutating in place, which keeps history
+  append-only and makes stale writes detectable.
+- **Optimistic concurrency in the repository.** `update()` takes the version the
+  caller read and fails with `ConcurrentUpdateError` (HTTP 409) if the task has
+  moved on. This avoids lost updates when, say, an approval and a cancellation
+  race, without holding locks across slow LLM or human steps. A database
+  adapter maps this to `UPDATE ... WHERE id = :id AND version = :expected`.
+- **Repository as a `Protocol` port, in-memory adapter first.** Persistence
+  technology is deferred until orchestration shows the real access patterns;
+  the adapter is injected through `create_app(task_repository=...)`.
+- **API schemas separate from the domain model**, so the public contract and
+  internal representation can evolve independently. Clients can create, read,
+  list, and cancel tasks; running/approval transitions are reserved for the
+  orchestrator and approval workflow rather than exposed as raw status writes.
 
 ## Technology stack
 
@@ -94,6 +140,29 @@ curl http://127.0.0.1:8000/health
 # {"status":"ok","service":"enterprise-agent-platform","environment":"development","version":"0.1.0"}
 ```
 
+Create, inspect, and cancel a task:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"goal": "Reconcile supplier payments for March", "requested_by": "analyst-1"}'
+# {"id":"<uuid>","status":"pending","is_terminal":false,"version":1,...,"history":[]}
+
+curl -s 'http://127.0.0.1:8000/tasks?status=pending&limit=20'
+curl -s http://127.0.0.1:8000/tasks/<uuid>
+
+curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/cancel \
+  -H 'Content-Type: application/json' -d '{"reason": "duplicate request"}'
+# 200 with status "cancelled"; cancelling again returns 409 Conflict
+```
+
+| Method & path              | Result                                                  |
+| -------------------------- | ------------------------------------------------------- |
+| `POST /tasks`              | 201 pending task; 422 on invalid or unknown fields      |
+| `GET /tasks`               | Newest first; optional `status` filter, `limit` 1–200   |
+| `GET /tasks/{id}`          | 200, or 404 if unknown                                  |
+| `POST /tasks/{id}/cancel`  | 200; 404 unknown; 409 terminal task or concurrent write |
+
 Interactive API docs are available at `http://127.0.0.1:8000/docs`.
 
 ## Quality checks
@@ -116,8 +185,9 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 
 ## Roadmap
 
-1. **Foundation** — service skeleton, config, logging, tests, CI ✅ *(current)*
-2. **Core domain** — request/task modeling, persistence
+1. **Foundation** — service skeleton, config, logging, tests, CI ✅
+2. **Core domain** — task lifecycle, repository port, task API ✅ *(current)*;
+   request correlation IDs and durable persistence next
 3. **AI capability** — agent orchestration, tool calling, MCP integration
 4. **Human-in-the-loop** — approval workflows, structured state
 5. **Evaluation** — agent evaluation harness and metrics
@@ -127,10 +197,11 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 
 ## Limitations
 
-This is an early foundation. It does **not** yet perform any agent work — there
-is no LLM integration, tool calling, or persistence. The health endpoint and
-configuration exist to anchor the operational foundation the rest of the
-platform will build on.
+The platform does **not** yet perform any agent work: there is no LLM
+integration, tool calling, or orchestrator moving tasks through `running`.
+Tasks are stored in process memory, so they are lost on restart and are not
+shared across multiple workers or replicas. There is no authentication yet, so
+`requested_by` is caller-supplied and not verified.
 
 ## License
 
