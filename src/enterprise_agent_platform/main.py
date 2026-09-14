@@ -1,8 +1,9 @@
 """FastAPI application entrypoint.
 
 Exposes the application factory and a module-level ``app`` for ASGI servers.
-Wires configuration, logging, health, and the task API. Agent orchestration,
-MCP integration, and tool calling arrive in later milestones.
+Wires configuration, logging, request correlation IDs, health, and the task
+API. Agent orchestration, MCP integration, and tool calling arrive in later
+milestones.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from pydantic import BaseModel
 from enterprise_agent_platform import __version__
 from enterprise_agent_platform.config import get_settings
 from enterprise_agent_platform.logging import configure_logging
+from enterprise_agent_platform.request_context import RequestContextMiddleware
 from enterprise_agent_platform.tasks.repository import InMemoryTaskRepository, TaskRepository
 from enterprise_agent_platform.tasks.router import router as tasks_router
 
@@ -59,6 +61,7 @@ def create_app(task_repository: TaskRepository | None = None) -> FastAPI:
     app.state.task_repository = (
         task_repository if task_repository is not None else InMemoryTaskRepository()
     )
+    app.add_middleware(RequestContextMiddleware)
     app.include_router(tasks_router)
 
     @app.get("/health", response_model=HealthResponse, tags=["system"])

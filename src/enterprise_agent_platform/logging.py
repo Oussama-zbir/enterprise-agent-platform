@@ -13,7 +13,23 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+from enterprise_agent_platform.request_context import get_request_id
+
 _RESERVED = frozenset(logging.LogRecord("", 0, "", 0, "", None, None).__dict__)
+
+
+class RequestContextFilter(logging.Filter):
+    """Attach the current request ID to records emitted during a request.
+
+    Runs in the emitting thread/task, where the request context is visible, so
+    the ID is captured even if formatting is later moved to a queue listener.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        request_id = get_request_id()
+        if request_id is not None:
+            record.request_id = request_id
+        return True
 
 
 class JsonFormatter(logging.Formatter):
@@ -46,6 +62,7 @@ def configure_logging(level: str = "INFO") -> None:
     """
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
+    handler.addFilter(RequestContextFilter())
 
     root = logging.getLogger()
     root.handlers.clear()

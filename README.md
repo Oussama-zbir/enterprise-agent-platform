@@ -3,9 +3,10 @@
 A production-oriented platform for building and operating enterprise AI agents.
 
 > **Status: core domain.** This repository is being built incrementally. It has
-> an engineering foundation (config, structured logging, strict typing, tests,
-> Docker, CI) and a task domain: an explicit agent-task lifecycle, a storage
-> port with optimistic concurrency, and a `/tasks` API. Agent orchestration,
+> an engineering foundation (config, structured logging with request
+> correlation IDs, strict typing, tests, Docker, CI) and a task domain: an
+> explicit agent-task lifecycle, a storage port with optimistic concurrency, and
+> a `/tasks` API. Agent orchestration,
 > tool calling, MCP integration, human-in-the-loop approval, and evaluation are
 > planned milestones (see [Roadmap](#roadmap)).
 
@@ -40,8 +41,8 @@ agent capabilities on top without disturbing the operational base.
                 |            +--> tool calling / MCP (later)       |
                 |            +--> human-in-the-loop (later)        |
                 |                                                  |
-                |  cross-cutting: config · structured logging ·   |
-                |  evaluation & observability (later)              |
+                |  cross-cutting: config · JSON logging ·          |
+                |  X-Request-ID correlation · tracing (later)      |
                 +--------------------------------------------------+
 ```
 
@@ -51,6 +52,7 @@ Current modules:
 | -------------------------------------- | ----------------------------------------------- |
 | `enterprise_agent_platform.config`     | Environment-based settings (Pydantic Settings)  |
 | `enterprise_agent_platform.logging`    | Structured JSON logging to stdout               |
+| `...request_context`                   | `X-Request-ID` middleware, request access logs  |
 | `enterprise_agent_platform.main`       | App factory, lifespan, `/health`, router wiring |
 | `...tasks.models`                      | `AgentTask` model and lifecycle state machine   |
 | `...tasks.repository`                  | `TaskRepository` port + in-memory adapter       |
@@ -81,6 +83,15 @@ and the approval workflow cannot disagree about what is legal.
 - **Structured JSON logging, dependency-free** — parseable in containers and
   cloud log aggregators today; a full OpenTelemetry tracing stack is deferred
   to the observability milestone rather than added prematurely.
+- **Request correlation IDs via a `ContextVar`.** A pure ASGI middleware assigns
+  each request an ID, returns it as `X-Request-ID`, and a logging filter stamps
+  it on every record emitted while the request runs — including logs from deep
+  in the service layer, without threading the ID through function signatures.
+  Pure ASGI (not `BaseHTTPMiddleware`) keeps the context in the endpoint's task
+  and avoids buffering responses. A caller-supplied ID is reused only if it is a
+  short token of `[A-Za-z0-9._:-]`; anything else is replaced, so the header
+  cannot be used for log injection. Unhandled exceptions are logged with the ID
+  and returned as a JSON 500 that still carries the header.
 - **`src/` layout** to keep the importable package separate from tooling and
   tests, and to catch packaging mistakes early.
 - **Strict typing and linting from day one** so quality is enforced by CI
@@ -163,6 +174,17 @@ curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/cancel \
 | `GET /tasks/{id}`          | 200, or 404 if unknown                                  |
 | `POST /tasks/{id}/cancel`  | 200; 404 unknown; 409 terminal task or concurrent write |
 
+Every response carries an `X-Request-ID` header (the caller's, if well-formed,
+otherwise a generated UUID), and every log line written during that request
+includes it:
+
+```bash
+curl -s -i http://127.0.0.1:8000/tasks -H 'X-Request-ID: req-42' | grep -i x-request-id
+# x-request-id: req-42
+# log: {"message": "request.completed", "method": "GET", "path": "/tasks",
+#       "status_code": 200, "duration_ms": 0.4, "request_id": "req-42", ...}
+```
+
 Interactive API docs are available at `http://127.0.0.1:8000/docs`.
 
 ## Quality checks
@@ -186,9 +208,10 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 ## Roadmap
 
 1. **Foundation** — service skeleton, config, logging, tests, CI ✅
-2. **Core domain** — task lifecycle, repository port, task API ✅ *(current)*;
-   request correlation IDs and durable persistence next
-3. **AI capability** — agent orchestration, tool calling, MCP integration
+2. **Core domain** — task lifecycle, repository port, task API, request
+   correlation IDs ✅
+3. **AI capability** — LLM provider abstraction, agent orchestration, tool
+   calling, MCP integration *(next)*
 4. **Human-in-the-loop** — approval workflows, structured state
 5. **Evaluation** — agent evaluation harness and metrics
 6. **Observability** — tracing, latency/cost accounting (OpenTelemetry)

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "enterprise-agent-platform"
 version = "0.1.0"
-description = "Production-oriented enterprise agent platform (foundation)."
+description = "Production-oriented enterprise agent platform."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
