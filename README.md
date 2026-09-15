@@ -58,6 +58,10 @@ Current modules:
 | `...tasks.repository`                  | `TaskRepository` port + in-memory adapter       |
 | `...tasks.service`                     | Load → transition → persist use case            |
 | `...tasks.router`                      | `/tasks` HTTP routes and API schemas            |
+| `...llm.models`                        | Provider-neutral request/completion types       |
+| `...llm.errors`                        | LLM failure taxonomy with `retryable` flag      |
+| `...llm.provider`                      | `LLMProvider` port + scripted fake provider     |
+| `...llm.client`                        | Timeouts, structured output, LLM call logs      |
 
 ### Task lifecycle
 
@@ -115,6 +119,23 @@ and the approval workflow cannot disagree about what is legal.
   internal representation can evolve independently. Clients can create, read,
   list, and cancel tasks; running/approval transitions are reserved for the
   orchestrator and approval workflow rather than exposed as raw status writes.
+- **LLM access behind a provider port.** Agent code depends on `LLMClient` and
+  provider-neutral types, never on a vendor SDK, so the Anthropic API, Bedrock,
+  and a deterministic fake are interchangeable. Adapters translate vendor
+  exceptions into one taxonomy (`LLMTimeoutError`, `LLMRateLimitError`,
+  `LLMUnavailableError`, `LLMRequestError`, `LLMRefusalError`,
+  `StructuredOutputError`) with a `retryable` flag; whether to retry stays with
+  the caller, which knows the task and its budget.
+- **Structured outputs are validated, not trusted.** `complete_structured`
+  sends the Pydantic model's JSON Schema so providers with native constrained
+  decoding can enforce it, then validates the response regardless. Truncation
+  (`max_tokens`) and refusals are reported as such instead of surfacing as
+  confusing JSON parse errors.
+- **One log record per model call, without content.** `llm.call.completed` /
+  `llm.call.failed` carry provider, model, operation, token usage, stop reason,
+  latency, and the request ID, which is the raw material for cost and latency
+  accounting. Prompt and response text are not logged, only their sizes,
+  because they may contain customer data.
 
 ## Technology stack
 
@@ -211,7 +232,7 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 2. **Core domain** — task lifecycle, repository port, task API, request
    correlation IDs ✅
 3. **AI capability** — LLM provider abstraction, agent orchestration, tool
-   calling, MCP integration *(next)*
+   calling, MCP integration *(in progress: provider port and client done)*
 4. **Human-in-the-loop** — approval workflows, structured state
 5. **Evaluation** — agent evaluation harness and metrics
 6. **Observability** — tracing, latency/cost accounting (OpenTelemetry)
@@ -220,8 +241,10 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 
 ## Limitations
 
-The platform does **not** yet perform any agent work: there is no LLM
-integration, tool calling, or orchestrator moving tasks through `running`.
+The platform does **not** yet perform any agent work. The LLM layer exists
+(provider port, client, fake provider) but no real provider adapter is wired
+in yet, and there is no tool calling or orchestrator moving tasks through
+`running`.
 Tasks are stored in process memory, so they are lost on restart and are not
 shared across multiple workers or replicas. There is no authentication yet, so
 `requested_by` is caller-supplied and not verified.
