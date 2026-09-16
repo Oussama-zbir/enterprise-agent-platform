@@ -2,13 +2,14 @@
 
 A production-oriented platform for building and operating enterprise AI agents.
 
-> **Status: core domain.** This repository is being built incrementally. It has
-> an engineering foundation (config, structured logging with request
-> correlation IDs, strict typing, tests, Docker, CI) and a task domain: an
-> explicit agent-task lifecycle, a storage port with optimistic concurrency, and
-> a `/tasks` API. Agent orchestration,
-> tool calling, MCP integration, human-in-the-loop approval, and evaluation are
-> planned milestones (see [Roadmap](#roadmap)).
+> **Status: AI capability.** This repository is being built incrementally. It
+> has an engineering foundation (config, structured logging with request
+> correlation IDs, strict typing, tests, Docker, CI), a task domain (an explicit
+> agent-task lifecycle, a storage port with optimistic concurrency, and a
+> `/tasks` API), and an LLM layer: a provider port with a real Anthropic /
+> Bedrock adapter behind it. Agent orchestration, tool calling, MCP integration,
+> human-in-the-loop approval, and evaluation are planned milestones (see
+> [Roadmap](#roadmap)).
 
 ## Problem statement
 
@@ -62,6 +63,8 @@ Current modules:
 | `...llm.errors`                        | LLM failure taxonomy with `retryable` flag      |
 | `...llm.provider`                      | `LLMProvider` port + scripted fake provider     |
 | `...llm.client`                        | Timeouts, structured output, LLM call logs      |
+| `...llm.anthropic_provider`            | Anthropic / Bedrock adapter for the port        |
+| `...llm.factory`                       | Backend selection from settings                 |
 
 ### Task lifecycle
 
@@ -131,6 +134,26 @@ and the approval workflow cannot disagree about what is legal.
   decoding can enforce it, then validates the response regardless. Truncation
   (`max_tokens`) and refusals are reported as such instead of surfacing as
   confusing JSON parse errors.
+- **The vendor SDK stops at the adapter.** `AnthropicProvider` is the only
+  module that imports `anthropic`. It maps HTTP status codes to the taxonomy
+  (408 → timeout, 429 → rate limit with the `retry-after` delay, 5xx →
+  unavailable, other 4xx → request error), translates stop reasons, and rejects
+  ones it cannot honour yet (`tool_use`) rather than silently mislabelling them
+  as a normal end of turn. Error messages carry the status code but never the
+  provider's error body, which can echo the prompt.
+- **Provider SDK retries are disabled (`max_retries=0`).** The SDK would happily
+  retry a 429 or 5xx inside a single `complete()` call, which both takes the
+  retry decision away from the caller — the only party that knows the task, its
+  deadline, and its budget — and inflates the latency recorded for what the logs
+  present as one model call.
+- **Schema dialects are adapted, not standardised.** The Messages API only
+  enforces a JSON Schema when its objects are closed; Pydantic emits open ones.
+  The adapter closes them on the way out, so the shared port stays free of one
+  vendor's rules.
+- **Misconfiguration fails at startup.** The default backend (`fake`) is offline
+  only and is rejected when `EAP_ENVIRONMENT=production`, so a deployment that
+  forgot to configure a model dies immediately instead of on the first customer
+  request.
 - **One log record per model call, without content.** `llm.call.completed` /
   `llm.call.failed` carry provider, model, operation, token usage, stop reason,
   latency, and the request ID, which is the raw material for cost and latency
@@ -141,6 +164,7 @@ and the approval workflow cannot disagree about what is legal.
 
 - Python 3.12+
 - FastAPI + Uvicorn
+- Anthropic SDK (Messages API, first-party or Bedrock)
 - Pydantic v2 / pydantic-settings
 - pytest + pytest-asyncio
 - Ruff (lint + format), mypy (strict)
@@ -155,6 +179,17 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
+```
+
+The default model backend is `fake`: offline, and every call raises. Point it at
+a real model with environment variables (never commit a key):
+
+```bash
+# Anthropic API — omit the key to use the SDK's own credential resolution
+EAP_LLM_PROVIDER=anthropic EAP_ANTHROPIC_API_KEY=sk-ant-... EAP_LLM_MODEL=claude-opus-5
+
+# Bedrock — credentials come from the standard AWS chain
+EAP_LLM_PROVIDER=bedrock EAP_AWS_REGION=eu-west-1 EAP_LLM_MODEL=anthropic.claude-opus-5
 ```
 
 ## Local development
@@ -232,7 +267,8 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 2. **Core domain** — task lifecycle, repository port, task API, request
    correlation IDs ✅
 3. **AI capability** — LLM provider abstraction, agent orchestration, tool
-   calling, MCP integration *(in progress: provider port and client done)*
+   calling, MCP integration *(in progress: provider port, client, and the
+   Anthropic / Bedrock adapter done)*
 4. **Human-in-the-loop** — approval workflows, structured state
 5. **Evaluation** — agent evaluation harness and metrics
 6. **Observability** — tracing, latency/cost accounting (OpenTelemetry)
@@ -241,10 +277,12 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 
 ## Limitations
 
-The platform does **not** yet perform any agent work. The LLM layer exists
-(provider port, client, fake provider) but no real provider adapter is wired
-in yet, and there is no tool calling or orchestrator moving tasks through
-`running`.
+The platform does **not** yet perform any agent work. The LLM layer can now
+reach a real model (port, client, Anthropic / Bedrock adapter), but nothing
+calls it: there is no tool calling and no orchestrator moving tasks through
+`running`. The adapter is tested against a mock HTTP transport rather than the
+live API, and it covers single-shot completions only — no streaming, tool use,
+or prompt caching yet.
 Tasks are stored in process memory, so they are lost on restart and are not
 shared across multiple workers or replicas. There is no authentication yet, so
 `requested_by` is caller-supplied and not verified.

@@ -12,6 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Oussama Zbir", email = "oussamazbirpro@gmail.com" }]
 keywords = ["agentic-ai", "fastapi", "mcp", "llm", "production-ai"]
 dependencies = [
+    "anthropic>=1.6",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "pydantic>=2.7",

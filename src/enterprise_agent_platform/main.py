@@ -17,6 +17,8 @@ from pydantic import BaseModel
 
 from enterprise_agent_platform import __version__
 from enterprise_agent_platform.config import get_settings
+from enterprise_agent_platform.llm.client import LLMClient
+from enterprise_agent_platform.llm.factory import build_llm_client
 from enterprise_agent_platform.logging import configure_logging
 from enterprise_agent_platform.request_context import RequestContextMiddleware
 from enterprise_agent_platform.tasks.repository import InMemoryTaskRepository, TaskRepository
@@ -43,14 +45,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Releases the model backend's HTTP connection pool.
+        await app.state.llm_client.aclose()
         logger.info("service.shutdown")
 
 
-def create_app(task_repository: TaskRepository | None = None) -> FastAPI:
+def create_app(
+    task_repository: TaskRepository | None = None,
+    llm_client: LLMClient | None = None,
+) -> FastAPI:
     """Build and configure a FastAPI application instance.
 
-    ``task_repository`` lets callers (tests, alternative deployments) inject a
-    storage adapter; it defaults to the in-memory implementation.
+    ``task_repository`` and ``llm_client`` let callers (tests, alternative
+    deployments) inject adapters; they default to the in-memory repository and
+    the model backend named by ``EAP_LLM_PROVIDER``.
     """
     settings = get_settings()
     app = FastAPI(
@@ -61,6 +69,7 @@ def create_app(task_repository: TaskRepository | None = None) -> FastAPI:
     app.state.task_repository = (
         task_repository if task_repository is not None else InMemoryTaskRepository()
     )
+    app.state.llm_client = llm_client if llm_client is not None else build_llm_client(settings)
     app.add_middleware(RequestContextMiddleware)
     app.include_router(tasks_router)
 

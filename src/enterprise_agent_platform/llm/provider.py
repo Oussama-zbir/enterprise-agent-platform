@@ -29,6 +29,10 @@ class LLMProvider(Protocol):
 
     async def complete(self, request: CompletionRequest) -> Completion: ...
 
+    async def aclose(self) -> None:
+        """Release held resources, such as an HTTP connection pool."""
+        ...
+
 
 class FakeLLMProvider:
     """Scripted provider for tests and offline development.
@@ -73,3 +77,6 @@ class FakeLLMProvider:
                 output_tokens=len(item.split()),
             ),
         )
+
+    async def aclose(self) -> None:
+        """No resources to release."""

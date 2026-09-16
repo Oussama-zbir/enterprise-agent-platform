@@ -35,6 +35,14 @@ class LLMClient:
         self._provider = provider
         self._timeout_seconds = timeout_seconds
 
+    @property
+    def provider_name(self) -> str:
+        return self._provider.name
+
+    async def aclose(self) -> None:
+        """Release the provider's resources; the client is unusable afterwards."""
+        await self._provider.aclose()
+
     async def complete(self, request: CompletionRequest, *, operation: str) -> Completion:
         """Call the provider once.
 
@@ -46,7 +54,7 @@ class LLMClient:
             LLMError: any provider failure, unchanged.
         """
         log_fields: dict[str, object] = {
-            "provider": self._provider.name,
+            "provider": self.provider_name,
             "operation": operation,
             "message_count": len(request.messages),
             "prompt_chars": sum(len(m.content) for m in request.messages),
@@ -57,7 +65,7 @@ class LLMClient:
                 completion = await self._provider.complete(request)
         except TimeoutError:
             error: Exception = LLMTimeoutError(
-                f"{self._provider.name} did not respond within {self._timeout_seconds}s"
+                f"{self.provider_name} did not respond within {self._timeout_seconds}s"
             )
             self._log_failure(error, started, log_fields)
             raise error from None
