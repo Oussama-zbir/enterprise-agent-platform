@@ -6,9 +6,11 @@ A production-oriented platform for building and operating enterprise AI agents.
 > has an engineering foundation (config, structured logging with request
 > correlation IDs, strict typing, tests, Docker, CI), a task domain (an explicit
 > agent-task lifecycle, a storage port with optimistic concurrency, and a
-> `/tasks` API), and an LLM layer: a provider port with a real Anthropic /
-> Bedrock adapter behind it. Agent orchestration, tool calling, MCP integration,
-> human-in-the-loop approval, and evaluation are planned milestones (see
+> `/tasks` API), an LLM layer (a provider port with a real Anthropic / Bedrock
+> adapter behind it, including tool calling), and a tool layer: typed tools with
+> risk metadata, validated arguments, and bounded execution. Agent
+> orchestration, MCP integration, human-in-the-loop approval, and evaluation are
+> planned milestones (see
 > [Roadmap](#roadmap)).
 
 ## Problem statement
@@ -65,6 +67,8 @@ Current modules:
 | `...llm.client`                        | Timeouts, structured output, LLM call logs      |
 | `...llm.anthropic_provider`            | Anthropic / Bedrock adapter for the port        |
 | `...llm.factory`                       | Backend selection from settings                 |
+| `...tools.models`                      | Typed tool definitions and risk levels          |
+| `...tools.registry`                    | Tool lookup, validation, bounded execution      |
 
 ### Task lifecycle
 
@@ -159,6 +163,29 @@ and the approval workflow cannot disagree about what is legal.
   latency, and the request ID, which is the raw material for cost and latency
   accounting. Prompt and response text are not logged, only their sizes,
   because they may contain customer data.
+- **Tools are typed, and their arguments are validated twice.** A tool declares
+  its arguments as a Pydantic model; that model generates the JSON Schema the
+  model sees (sent with `strict: true`, so the provider constrains decoding) and
+  validates what comes back. Handlers therefore receive a typed object, never a
+  raw dictionary produced by a language model.
+- **A model's mistakes are data; a programmer's are exceptions.** An unknown
+  tool name, invalid arguments, a handler that fails or hangs — each returns a
+  `ToolResult` with `is_error`, which the orchestrator feeds back so the model
+  can correct itself. Aborting the task would throw away a run that is usually
+  still recoverable. Registering two tools under one name still raises.
+- **What returns to the model is bounded and scrubbed.** Handler exception
+  messages are logged but never returned — they can carry connection strings or
+  internal identifiers, and everything returned here re-enters the prompt, which
+  is also a prompt-injection surface. Results are truncated so one chatty tool
+  cannot consume the context window. Validation errors *are* returned: the model
+  wrote those arguments, and naming the bad field is what lets it retry.
+- **Risk is metadata on the tool; approval is policy.** Each tool declares
+  `read`, `write`, or `critical`, and `requires_approval` compares that against
+  a deployment-wide threshold. A stricter deployment lowers one threshold
+  instead of editing every tool, and the approval workflow will read the same
+  function the orchestrator does.
+- **Tools are offered per request, not held on the client**, so an orchestrator
+  can narrow the set per task: a model cannot misuse a tool it was never given.
 
 ## Technology stack
 
@@ -267,8 +294,8 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 2. **Core domain** — task lifecycle, repository port, task API, request
    correlation IDs ✅
 3. **AI capability** — LLM provider abstraction, agent orchestration, tool
-   calling, MCP integration *(in progress: provider port, client, and the
-   Anthropic / Bedrock adapter done)*
+   calling, MCP integration *(in progress: provider port, client, the Anthropic
+   / Bedrock adapter, and the tool registry done)*
 4. **Human-in-the-loop** — approval workflows, structured state
 5. **Evaluation** — agent evaluation harness and metrics
 6. **Observability** — tracing, latency/cost accounting (OpenTelemetry)
@@ -277,12 +304,12 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 
 ## Limitations
 
-The platform does **not** yet perform any agent work. The LLM layer can now
-reach a real model (port, client, Anthropic / Bedrock adapter), but nothing
-calls it: there is no tool calling and no orchestrator moving tasks through
-`running`. The adapter is tested against a mock HTTP transport rather than the
-live API, and it covers single-shot completions only — no streaming, tool use,
-or prompt caching yet.
+The platform does **not** yet perform any agent work. The pieces exist — a model
+can be called, tools can be declared and executed — but nothing drives them: the
+orchestrator that moves a task through `running` is the next milestone, so no
+tool is registered in the running service yet. The adapter is tested against a
+mock HTTP transport rather than the live API, and does not cover streaming or
+prompt caching.
 Tasks are stored in process memory, so they are lost on restart and are not
 shared across multiple workers or replicas. There is no authentication yet, so
 `requested_by` is caller-supplied and not verified.

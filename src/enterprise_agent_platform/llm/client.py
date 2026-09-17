@@ -58,6 +58,7 @@ class LLMClient:
             "operation": operation,
             "message_count": len(request.messages),
             "prompt_chars": sum(len(m.content) for m in request.messages),
+            "tool_count": len(request.tools),
         }
         started = time.perf_counter()
         try:
@@ -82,6 +83,9 @@ class LLMClient:
                 "input_tokens": completion.usage.input_tokens,
                 "output_tokens": completion.usage.output_tokens,
                 "response_chars": len(completion.text),
+                # Tool names are schema, not user data, so they are safe to log
+                # and show which capabilities the model actually reaches for.
+                "tool_calls": [call.name for call in completion.tool_calls],
                 "duration_ms": _elapsed_ms(started),
             },
         )
@@ -96,9 +100,14 @@ class LLMClient:
         structured outputs can enforce it; validation here is the guarantee.
 
         Raises:
+            ValueError: if the request also offers tools — a turn that ends in a
+                tool call produces no JSON to validate, so the two modes are
+                kept apart instead of failing confusingly at parse time.
             LLMRefusalError: if the model declined to answer.
             StructuredOutputError: if the output was truncated or does not match.
         """
+        if request.tools:
+            raise ValueError("complete_structured cannot be combined with tools")
         request = request.model_copy(update={"output_schema": schema.model_json_schema()})
         completion = await self.complete(request, operation=operation)
 

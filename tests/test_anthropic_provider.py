@@ -32,6 +32,9 @@ from enterprise_agent_platform.llm.models import (
     Role,
     StopReason,
     TokenUsage,
+    ToolCall,
+    ToolResult,
+    ToolSpec,
 )
 
 Handler = Callable[[httpx2.Request], httpx2.Response]
@@ -46,6 +49,23 @@ class Step(BaseModel):
 class Plan(BaseModel):
     steps: list[Step]
     requires_approval: bool = False
+
+
+class InvoiceArgs(BaseModel):
+    invoice_id: str
+
+
+class ReportArgs(BaseModel):
+    """Every field optional — Pydantic then omits ``required`` entirely."""
+
+    period: str = "month"
+
+
+INVOICE_TOOL = ToolSpec(
+    name="lookup_invoice",
+    description="Look up an invoice by id.",
+    input_schema=InvoiceArgs.model_json_schema(),
+)
 
 
 def make_request(**overrides: Any) -> CompletionRequest:
@@ -168,7 +188,7 @@ async def test_stop_reasons_are_mapped(api_stop_reason: str, expected: StopReaso
     assert result.stop_reason is expected
 
 
-@pytest.mark.parametrize("stop_reason", ["tool_use", "model_context_window_exceeded", None])
+@pytest.mark.parametrize("stop_reason", ["model_context_window_exceeded", "pause_turn", None])
 async def test_unsupported_stop_reason_fails_loudly(stop_reason: str | None) -> None:
     provider, _ = responding(message_response(stop_reason=stop_reason))
 
@@ -285,6 +305,98 @@ async def test_a_failed_call_is_not_retried_inside_the_adapter() -> None:
         await build_provider(handler).complete(make_request())
 
     assert len(attempts) == 1
+
+
+async def test_tools_are_declared_with_closed_strict_schemas() -> None:
+    provider, sent = responding(message_response())
+
+    await provider.complete(make_request(tools=(INVOICE_TOOL,)))
+
+    [tool] = json.loads(sent[0].content)["tools"]
+    assert tool["name"] == "lookup_invoice"
+    assert tool["description"] == "Look up an invoice by id."
+    assert tool["input_schema"]["additionalProperties"] is False
+    # Constrained decoding: the model can only produce arguments that validate.
+    assert tool["strict"] is True
+
+
+def test_strict_json_schema_declares_required_even_when_nothing_is_required() -> None:
+    schema = strict_json_schema(ReportArgs.model_json_schema())
+
+    assert schema["required"] == []
+
+
+async def test_a_tool_use_response_becomes_tool_calls() -> None:
+    provider, _ = responding(
+        message_response(
+            content=[
+                {"type": "text", "text": "checking the ledger"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "lookup_invoice",
+                    "input": {"invoice_id": "INV-1"},
+                },
+            ],
+            stop_reason="tool_use",
+        )
+    )
+
+    result = await provider.complete(make_request(tools=(INVOICE_TOOL,)))
+
+    assert result.stop_reason is StopReason.TOOL_USE
+    assert result.text == "checking the ledger"
+    assert result.tool_calls == (
+        ToolCall(id="toolu_1", name="lookup_invoice", arguments={"invoice_id": "INV-1"}),
+    )
+
+
+async def test_tool_calls_and_their_results_are_sent_back_as_content_blocks() -> None:
+    provider, sent = responding(message_response())
+    completion = Completion(
+        text="checking",
+        model="claude-opus-5",
+        stop_reason=StopReason.TOOL_USE,
+        usage=TokenUsage(input_tokens=1, output_tokens=1),
+        tool_calls=(ToolCall(id="toolu_1", name="lookup_invoice", arguments={"invoice_id": "X"}),),
+    )
+    results = (ToolResult(call_id="toolu_1", content="no such invoice", is_error=True),)
+
+    await provider.complete(
+        CompletionRequest(
+            messages=(
+                Message(role=Role.USER, content=PROMPT),
+                Message.from_completion(completion),
+                Message.with_tool_results(results),
+            ),
+            tools=(INVOICE_TOOL,),
+        )
+    )
+
+    messages = json.loads(sent[0].content)["messages"]
+    assert messages[1] == {
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": "checking"},
+            {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "lookup_invoice",
+                "input": {"invoice_id": "X"},
+            },
+        ],
+    }
+    assert messages[2] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "no such invoice",
+                "is_error": True,
+            }
+        ],
+    }
 
 
 async def test_aclose_releases_the_underlying_client() -> None:

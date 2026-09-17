@@ -26,8 +26,16 @@ from anthropic import (
     RateLimitError,
     omit,
 )
+from anthropic.types import (
+    ContentBlockParam,
+    MessageParam,
+    OutputConfigParam,
+    ToolParam,
+    ToolResultBlockParam,
+    ToolUseBlock,
+)
 from anthropic.types import Message as AnthropicMessage
-from anthropic.types import MessageParam, OutputConfigParam
+from anthropic.types.tool_param import InputSchema
 
 from enterprise_agent_platform.llm.errors import (
     LLMError,
@@ -43,6 +51,7 @@ from enterprise_agent_platform.llm.models import (
     Role,
     StopReason,
     TokenUsage,
+    ToolCall,
 )
 
 AsyncAnthropicClient = AsyncAnthropic | AsyncAnthropicBedrockMantle
@@ -53,9 +62,11 @@ _STOP_REASONS: dict[str, StopReason] = {
     "max_tokens": StopReason.MAX_TOKENS,
     "stop_sequence": StopReason.STOP_SEQUENCE,
     "refusal": StopReason.REFUSAL,
+    "tool_use": StopReason.TOOL_USE,
 }
-"""Stop reasons this milestone can serve. Tool use arrives with the orchestrator;
-anything else (including ``model_context_window_exceeded``) is a request error."""
+"""Stop reasons this platform can serve. Anything else (including
+``model_context_window_exceeded``) is reported as a request error rather than
+quietly mislabelled as a normal end of turn."""
 
 
 class AnthropicProvider:
@@ -88,6 +99,7 @@ class AnthropicProvider:
                 system=request.system if request.system is not None else omit,
                 messages=[_message_param(message) for message in request.messages],
                 output_config=_output_config(request),
+                tools=_tool_params(request),
             )
         except APITimeoutError as exc:
             raise LLMTimeoutError(f"{self._name} request timed out") from exc
@@ -133,16 +145,28 @@ class AnthropicProvider:
                 input_tokens=message.usage.input_tokens,
                 output_tokens=message.usage.output_tokens,
             ),
+            tool_calls=tuple(
+                self._to_tool_call(block) for block in message.content if block.type == "tool_use"
+            ),
         )
+
+    def _to_tool_call(self, block: ToolUseBlock) -> ToolCall:
+        if not isinstance(block.input, dict):
+            # The API documents tool input as a JSON object; anything else would
+            # silently reach a handler as arguments it cannot validate.
+            raise LLMRequestError(f"{self._name} returned non-object arguments for a tool call")
+        return ToolCall(id=block.id, name=block.name, arguments=cast(dict[str, Any], block.input))
 
 
 def strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Close every object in ``schema`` with ``additionalProperties: false``.
 
-    The Messages API enforces a JSON Schema only when its objects are closed,
-    while Pydantic emits open objects. Adapting the dialect belongs here rather
-    than in the shared port, which should not know one vendor's rules. Field
-    optionality is left exactly as the model declared it.
+    The API enforces a JSON Schema — for structured outputs and for strict tool
+    arguments — only when its objects are closed and state their ``required``
+    fields; Pydantic emits open objects and omits ``required`` entirely when
+    every field is optional. Adapting the dialect belongs here rather than in
+    the shared port, which should not know one vendor's rules. Field optionality
+    is left exactly as the model declared it.
     """
     return cast(dict[str, Any], _close_objects(schema))
 
@@ -152,6 +176,8 @@ def _close_objects(node: Any) -> Any:
         closed = {key: _close_objects(value) for key, value in node.items()}
         if closed.get("type") == "object" and "additionalProperties" not in closed:
             closed["additionalProperties"] = False
+        if closed.get("type") == "object" and "properties" in closed and "required" not in closed:
+            closed["required"] = []
         return closed
     if isinstance(node, list):
         return [_close_objects(item) for item in node]
@@ -159,8 +185,54 @@ def _close_objects(node: Any) -> Any:
 
 
 def _message_param(message: Message) -> MessageParam:
+    """Render a turn as Messages API content.
+
+    Plain text turns stay a bare string — the common case, and the form the API
+    documents. Turns carrying tool calls or their results become block lists;
+    all results for one assistant turn travel in a single user message, which is
+    what keeps the model issuing parallel tool calls.
+    """
     role: Literal["user", "assistant"] = "user" if message.role is Role.USER else "assistant"
-    return {"role": role, "content": message.content}
+    if not message.tool_calls and not message.tool_results:
+        return {"role": role, "content": message.content}
+
+    blocks: list[ContentBlockParam] = []
+    for result in message.tool_results:
+        tool_result: ToolResultBlockParam = {
+            "type": "tool_result",
+            "tool_use_id": result.call_id,
+            "content": result.content,
+            "is_error": result.is_error,
+        }
+        blocks.append(tool_result)
+    if message.content:
+        blocks.append({"type": "text", "text": message.content})
+    blocks.extend(
+        {"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments}
+        for call in message.tool_calls
+    )
+    return {"role": role, "content": blocks}
+
+
+def _tool_params(request: CompletionRequest) -> list[ToolParam] | Omit:
+    """Declare the offered tools.
+
+    ``strict`` asks the API to constrain decoding to the schema, so arguments
+    arrive well-formed instead of costing a correction round trip. The tool
+    layer validates them again regardless: the guarantee has to hold for every
+    provider, not only the ones that support constrained decoding.
+    """
+    if not request.tools:
+        return omit
+    return [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": cast(InputSchema, strict_json_schema(tool.input_schema)),
+            "strict": True,
+        }
+        for tool in request.tools
+    ]
 
 
 def _output_config(request: CompletionRequest) -> OutputConfigParam | Omit:
