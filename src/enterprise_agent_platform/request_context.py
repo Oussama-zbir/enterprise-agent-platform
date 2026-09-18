@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from uuid import uuid4
 
@@ -37,6 +39,25 @@ logger = logging.getLogger(__name__)
 def get_request_id() -> str | None:
     """Return the ID of the request currently being handled, if any."""
     return _request_id.get()
+
+
+@contextmanager
+def bind_request_id(request_id: str | None) -> Iterator[None]:
+    """Attach ``request_id`` to logs emitted inside the block.
+
+    The middleware covers work done while an HTTP request is open. Work that
+    outlives it — an agent run handed to a background worker — has no such
+    context, so the originating ID is passed explicitly and bound here. ``None``
+    leaves whatever context is already in place untouched.
+    """
+    if request_id is None:
+        yield
+        return
+    token = _request_id.set(request_id)
+    try:
+        yield
+    finally:
+        _request_id.reset(token)
 
 
 def resolve_request_id(candidate: str | None) -> str:

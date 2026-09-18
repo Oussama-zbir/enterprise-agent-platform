@@ -1,9 +1,9 @@
 """FastAPI application entrypoint.
 
 Exposes the application factory and a module-level ``app`` for ASGI servers.
-Wires configuration, logging, request correlation IDs, health, and the task
-API. Agent orchestration, MCP integration, and tool calling arrive in later
-milestones.
+Wires configuration, logging, request correlation IDs, health, the task API, and
+the agent runner with the tool registry it may call. MCP integration and the
+approval workflow arrive in later milestones.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from enterprise_agent_platform import __version__
+from enterprise_agent_platform.agent.runner import AgentRunner
 from enterprise_agent_platform.config import get_settings
 from enterprise_agent_platform.llm.client import LLMClient
 from enterprise_agent_platform.llm.factory import build_llm_client
@@ -23,6 +24,7 @@ from enterprise_agent_platform.logging import configure_logging
 from enterprise_agent_platform.request_context import RequestContextMiddleware
 from enterprise_agent_platform.tasks.repository import InMemoryTaskRepository, TaskRepository
 from enterprise_agent_platform.tasks.router import router as tasks_router
+from enterprise_agent_platform.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +55,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(
     task_repository: TaskRepository | None = None,
     llm_client: LLMClient | None = None,
+    tool_registry: ToolRegistry | None = None,
 ) -> FastAPI:
     """Build and configure a FastAPI application instance.
 
-    ``task_repository`` and ``llm_client`` let callers (tests, alternative
-    deployments) inject adapters; they default to the in-memory repository and
-    the model backend named by ``EAP_LLM_PROVIDER``.
+    The three adapters are injectable (tests, alternative deployments) and
+    default to the in-memory repository, the model backend named by
+    ``EAP_LLM_PROVIDER``, and an empty tool registry. An empty registry is a
+    deliberate default: a deployment declares the tools its agents may use, so
+    the platform ships with no capabilities of its own.
     """
     settings = get_settings()
     app = FastAPI(
@@ -70,6 +75,15 @@ def create_app(
         task_repository if task_repository is not None else InMemoryTaskRepository()
     )
     app.state.llm_client = llm_client if llm_client is not None else build_llm_client(settings)
+    app.state.tool_registry = tool_registry if tool_registry is not None else ToolRegistry()
+    app.state.agent_runner = AgentRunner(
+        app.state.llm_client,
+        app.state.tool_registry,
+        app.state.task_repository,
+        max_steps=settings.agent_max_steps,
+        max_tokens=settings.agent_max_tokens,
+        auto_approve_up_to=settings.agent_auto_approve_up_to,
+    )
     app.add_middleware(RequestContextMiddleware)
     app.include_router(tasks_router)
 

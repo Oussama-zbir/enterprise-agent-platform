@@ -7,11 +7,11 @@ A production-oriented platform for building and operating enterprise AI agents.
 > correlation IDs, strict typing, tests, Docker, CI), a task domain (an explicit
 > agent-task lifecycle, a storage port with optimistic concurrency, and a
 > `/tasks` API), an LLM layer (a provider port with a real Anthropic / Bedrock
-> adapter behind it, including tool calling), and a tool layer: typed tools with
-> risk metadata, validated arguments, and bounded execution. Agent
-> orchestration, MCP integration, human-in-the-loop approval, and evaluation are
-> planned milestones (see
-> [Roadmap](#roadmap)).
+> adapter behind it, including tool calling), a tool layer (typed tools with risk
+> metadata, validated arguments, and bounded execution), and the agent runner
+> that drives a task through model and tool calls under a step budget. MCP
+> integration, human-in-the-loop approval, and evaluation are planned milestones
+> (see [Roadmap](#roadmap)).
 
 ## Problem statement
 
@@ -40,8 +40,10 @@ agent capabilities on top without disturbing the operational base.
                 |      v                                           |
                 |  AgentTask state machine                         |
                 |      ^                                           |
-                |      +-- agent orchestration (later)             |
-                |            +--> tool calling / MCP (later)       |
+                |      +-- AgentRunner (model <-> tool loop)       |
+                |            +--> LLMClient --> provider port      |
+                |            +--> ToolRegistry (typed tools)       |
+                |            +--> MCP (later)                      |
                 |            +--> human-in-the-loop (later)        |
                 |                                                  |
                 |  cross-cutting: config · JSON logging ·          |
@@ -69,6 +71,7 @@ Current modules:
 | `...llm.factory`                       | Backend selection from settings                 |
 | `...tools.models`                      | Typed tool definitions and risk levels          |
 | `...tools.registry`                    | Tool lookup, validation, bounded execution      |
+| `...agent.runner`                      | The run loop: model calls, tools, budgets        |
 
 ### Task lifecycle
 
@@ -186,6 +189,44 @@ and the approval workflow cannot disagree about what is legal.
   function the orchestrator does.
 - **Tools are offered per request, not held on the client**, so an orchestrator
   can narrow the set per task: a model cannot misuse a tool it was never given.
+- **Every run is bounded, and exhausting the budget is a real outcome.** A model
+  that keeps calling tools is a common failure mode that costs money and latency
+  until something stops it. `EAP_AGENT_MAX_STEPS` caps the model calls in one
+  run; hitting the cap fails the task with that reason in its history rather
+  than looping or silently returning a half-finished answer.
+- **Starting a run is a state transition, so a task has at most one agent.**
+  `pending -> running` goes through the repository's version check, so two
+  callers racing to start the same task produce one run and one 409 — not two
+  agents doing the same work with the same tools.
+- **Cancellation is cooperative, and the human wins.** The task is re-read
+  between steps, so a cancelled task stops before the next model call. If the
+  cancellation lands while a step is in flight, the run's final transition is
+  rejected by the lifecycle and its outcome is discarded rather than overwriting
+  the human's decision.
+- **An approval pause stops the whole turn, not the risky call.** When any tool
+  in a turn exceeds `EAP_AGENT_AUTO_APPROVE_UP_TO`, nothing from that turn runs
+  and the task moves to `awaiting_approval`. Executing the rest would mean
+  reconstructing a partially applied turn on approval, and the remaining calls
+  may depend on the paused one.
+- **Agent failures are outcomes, not exceptions.** A provider error, a refusal,
+  a truncated answer, an exhausted budget — each ends with the task in `failed`
+  and a reason in its history; only genuine lifecycle errors (unknown task, task
+  not startable) propagate as 404/409. The reason returned to the caller is the
+  same string recorded in the audit trail, so the API and the history cannot
+  disagree. Provider error text is not copied into it, since it can echo the
+  prompt.
+- **The prompt carries the goal, not the requester.** `requested_by` is
+  unverified caller input, so it stays out of the prompt; the system prompt
+  tells the model that tool results are data, never instructions.
+- **`POST /tasks/{id}/run` is synchronous for now.** The caller waits, which is
+  honest for a single-process deployment. Because progress is recorded on the
+  task rather than in the response, moving execution to a queue and returning
+  202 changes the entrypoint, not the domain logic.
+- **One log record per run** (`agent.run.completed`) with steps, tool calls,
+  token totals, latency, and the originating request ID. The request ID is
+  passed into `AgentRunner.run` explicitly rather than read from a context
+  variable, so a run handed to a background worker still correlates with the
+  request that created the task.
 
 ## Technology stack
 
@@ -250,11 +291,28 @@ curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/cancel \
 # 200 with status "cancelled"; cancelling again returns 409 Conflict
 ```
 
+Run a task with the agent loop:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/run
+# {"task":{"status":"completed","version":3,"history":[...]},
+#  "output":"...", "detail":"agent run completed",
+#  "steps":2, "tool_calls":1, "input_tokens":812, "output_tokens":96,
+#  "pending_tool_calls":[]}
+```
+
+The run drives the task: `pending -> running -> completed | failed`, or
+`awaiting_approval` when the model asks for a tool riskier than
+`EAP_AGENT_AUTO_APPROVE_UP_TO` (then `pending_tool_calls` names what it wants).
+Running the same task twice returns 409. The platform ships with no tools of its
+own; a deployment registers its own through `create_app(tool_registry=...)`.
+
 | Method & path              | Result                                                  |
 | -------------------------- | ------------------------------------------------------- |
 | `POST /tasks`              | 201 pending task; 422 on invalid or unknown fields      |
 | `GET /tasks`               | Newest first; optional `status` filter, `limit` 1–200   |
 | `GET /tasks/{id}`          | 200, or 404 if unknown                                  |
+| `POST /tasks/{id}/run`     | 200 with the run outcome; 404 unknown; 409 not pending  |
 | `POST /tasks/{id}/cancel`  | 200; 404 unknown; 409 terminal task or concurrent write |
 
 Every response carries an `X-Request-ID` header (the caller's, if well-formed,
@@ -295,7 +353,7 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
    correlation IDs ✅
 3. **AI capability** — LLM provider abstraction, agent orchestration, tool
    calling, MCP integration *(in progress: provider port, client, the Anthropic
-   / Bedrock adapter, and the tool registry done)*
+   / Bedrock adapter, the tool registry, and the agent run loop done; MCP next)*
 4. **Human-in-the-loop** — approval workflows, structured state
 5. **Evaluation** — agent evaluation harness and metrics
 6. **Observability** — tracing, latency/cost accounting (OpenTelemetry)
@@ -304,15 +362,17 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 
 ## Limitations
 
-The platform does **not** yet perform any agent work. The pieces exist — a model
-can be called, tools can be declared and executed — but nothing drives them: the
-orchestrator that moves a task through `running` is the next milestone, so no
-tool is registered in the running service yet. The adapter is tested against a
-mock HTTP transport rather than the live API, and does not cover streaming or
-prompt caching.
-Tasks are stored in process memory, so they are lost on restart and are not
-shared across multiple workers or replicas. There is no authentication yet, so
-`requested_by` is caller-supplied and not verified.
+Agent runs execute inside the API process while the caller waits, so a long run
+holds an HTTP connection and a restart loses it; moving execution behind a queue
+needs durable tasks first. A run that pauses for approval stops there: the
+conversation is not persisted, so resuming an approved task is part of the
+human-in-the-loop milestone, together with the approve/reject endpoints. No
+tools ship with the platform — a deployment registers its own — so an
+out-of-the-box run is a single model call. The adapter is tested against a mock
+HTTP transport rather than the live API, and does not cover streaming or prompt
+caching. Tasks are stored in process memory, so they are lost on restart and are
+not shared across multiple workers or replicas. There is no authentication yet,
+so `requested_by` is caller-supplied and not verified.
 
 ## License
 

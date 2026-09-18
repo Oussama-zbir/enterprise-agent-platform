@@ -12,6 +12,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from enterprise_agent_platform.tools.models import RiskLevel
+
 Environment = Literal["development", "staging", "production", "test"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 LLMProviderName = Literal["fake", "anthropic", "bedrock"]
@@ -53,6 +55,20 @@ class Settings(BaseSettings):
         description="Falls back to the SDK's own credential resolution when unset.",
     )
     aws_region: str = Field(default="us-east-1", description="Region for the Bedrock backend.")
+
+    agent_max_steps: int = Field(
+        default=8,
+        ge=1,
+        le=50,
+        description="Model calls allowed in one agent run; bounds cost and tool loops.",
+    )
+    agent_max_tokens: int = Field(
+        default=1024, ge=1, description="Output token budget for a single agent step."
+    )
+    agent_auto_approve_up_to: RiskLevel = Field(
+        default=RiskLevel.READ,
+        description="Highest tool risk an agent may run unattended; above it, a human decides.",
+    )
 
     @model_validator(mode="after")
     def _require_a_real_provider_in_production(self) -> Settings:
