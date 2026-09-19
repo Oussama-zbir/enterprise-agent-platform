@@ -13,7 +13,7 @@ from typing import NamedTuple
 import pytest
 from pydantic import BaseModel
 
-from enterprise_agent_platform.agent.runner import AgentRunner
+from enterprise_agent_platform.agent.runner import AgentRunner, NotResumableError
 from enterprise_agent_platform.llm.client import LLMClient
 from enterprise_agent_platform.llm.errors import LLMError, LLMUnavailableError
 from enterprise_agent_platform.llm.models import (
@@ -303,6 +303,187 @@ async def test_an_outcome_that_arrives_after_a_cancellation_is_discarded() -> No
     assert result.output == ""  # the completed answer is not reported as the task's
     stored = await repository.get(task_id)
     assert stored.status is TaskStatus.CANCELLED
+
+
+class Paused(NamedTuple):
+    harness: Harness
+    executed: list[str]
+
+
+async def paused_run(*, follow_up: list[Completion] | None = None, max_steps: int = 8) -> Paused:
+    """A run stopped at an approval gate, with the tool it wants to use."""
+    executed: list[str] = []
+
+    async def pay(args: LookupArgs) -> str:
+        executed.append(args.invoice_id)
+        return f"paid {args.invoice_id}"
+
+    h = await harness(
+        [tool_use(), *(follow_up or [])],
+        tools=[lookup_tool(risk=RiskLevel.CRITICAL, handler=pay)],
+        auto_approve_up_to=RiskLevel.WRITE,
+        max_steps=max_steps,
+    )
+    result = await h.runner.run(h.task.id)
+    assert result.status is TaskStatus.AWAITING_APPROVAL
+    return Paused(h, executed)
+
+
+async def test_a_pause_checkpoints_the_conversation_on_the_task() -> None:
+    p = await paused_run()
+
+    stored = await p.harness.repository.get(p.harness.task.id)
+
+    assert stored.checkpoint is not None
+    assert [m.role for m in stored.checkpoint.messages] == [Role.USER, Role.ASSISTANT]
+    assert [c.name for c in stored.checkpoint.pending_calls] == ["lookup_invoice"]
+    # The step already spent is carried, not forgotten.
+    assert stored.checkpoint.steps == 1
+
+
+async def test_approving_continues_the_paused_run_instead_of_restarting_it() -> None:
+    p = await paused_run(follow_up=[answer("INV-1 settled.")])
+    h = p.harness
+
+    result = await h.runner.resume(h.task.id, approved_by="manager-2")
+
+    assert result.status is TaskStatus.COMPLETED
+    assert result.output == "INV-1 settled."
+    assert p.executed == ["INV-1"]  # the held call ran, once
+    # The model is asked to continue the same conversation, not to start over.
+    follow_up = h.provider.requests[1].messages
+    assert [m.role for m in follow_up] == [Role.USER, Role.ASSISTANT, Role.USER]
+    assert "Reconcile supplier payments" in follow_up[0].content
+    assert follow_up[2].tool_results[0].content == "paid INV-1"
+    assert (result.steps, result.tool_calls) == (2, 1)
+
+
+async def test_the_checkpoint_is_dropped_once_the_task_moves_on() -> None:
+    p = await paused_run(follow_up=[answer()])
+    h = p.harness
+
+    await h.runner.resume(h.task.id, approved_by="manager-2")
+
+    assert (await h.repository.get(h.task.id)).checkpoint is None
+
+
+async def test_the_approver_is_recorded_in_the_task_history() -> None:
+    p = await paused_run(follow_up=[answer()])
+    h = p.harness
+
+    await h.runner.resume(h.task.id, approved_by="manager-2", note="supplier verified")
+
+    stored = await h.repository.get(h.task.id)
+    resumption = stored.history[-2]
+    assert resumption.to_status is TaskStatus.RUNNING
+    assert resumption.reason == "approved by manager-2: supplier verified"
+
+
+async def test_approval_does_not_reset_the_step_budget() -> None:
+    p = await paused_run(max_steps=1)
+    h = p.harness
+
+    result = await h.runner.resume(h.task.id, approved_by="manager-2")
+
+    # Otherwise a run could be paused and approved its way around max_steps.
+    assert result.status is TaskStatus.FAILED
+    assert "step budget" in result.detail
+    assert p.executed == ["INV-1"]  # the approved call still ran
+    assert len(h.provider.requests) == 1
+
+
+async def test_rejecting_cancels_the_task_and_drops_the_denied_calls() -> None:
+    p = await paused_run(follow_up=[answer()])
+    h = p.harness
+
+    task = await h.runner.reject(h.task.id, rejected_by="manager-2", reason="supplier unverified")
+
+    assert task.status is TaskStatus.CANCELLED
+    assert task.checkpoint is None
+    assert p.executed == []
+    assert task.history[-1].reason == "rejected by manager-2: supplier unverified"
+
+
+async def test_a_rejected_run_cannot_be_approved_afterwards() -> None:
+    p = await paused_run(follow_up=[answer()])
+    h = p.harness
+    await h.runner.reject(h.task.id, rejected_by="manager-2")
+
+    with pytest.raises(InvalidTransitionError):
+        await h.runner.resume(h.task.id, approved_by="manager-3")
+
+
+async def test_only_the_first_approval_takes_effect() -> None:
+    p = await paused_run(follow_up=[answer()])
+    h = p.harness
+    await h.runner.resume(h.task.id, approved_by="manager-2")
+
+    with pytest.raises(InvalidTransitionError):
+        await h.runner.resume(h.task.id, approved_by="manager-3")
+
+    assert p.executed == ["INV-1"]  # the critical call is not replayed
+
+
+async def test_a_task_that_never_paused_cannot_be_approved() -> None:
+    h = await harness([answer()])
+
+    with pytest.raises(InvalidTransitionError):
+        await h.runner.resume(h.task.id, approved_by="manager-2")
+
+    assert h.provider.requests == []
+
+
+async def test_a_paused_task_with_no_run_state_is_not_resumed_silently() -> None:
+    h = await harness([answer()])
+    await transition_task(h.repository, h.task.id, TaskStatus.RUNNING)
+    await transition_task(h.repository, h.task.id, TaskStatus.AWAITING_APPROVAL)
+
+    # Resuming from nothing would quietly restart the run instead of continuing it.
+    with pytest.raises(NotResumableError):
+        await h.runner.resume(h.task.id, approved_by="manager-2")
+
+
+async def test_the_approval_view_marks_only_the_calls_that_tripped_the_gate() -> None:
+    mixed_turn = Completion(
+        text="",
+        model="fake-model",
+        stop_reason=StopReason.TOOL_USE,
+        usage=TokenUsage(input_tokens=10, output_tokens=5),
+        tool_calls=(
+            ToolCall(id="call_1", name="list_invoices", arguments={"invoice_id": "INV-1"}),
+            ToolCall(id="call_2", name="lookup_invoice", arguments={"invoice_id": "INV-2"}),
+        ),
+    )
+    listing = Tool(
+        name="list_invoices",
+        description="List invoices.",
+        arguments=LookupArgs,
+        risk=RiskLevel.READ,
+        handler=_lookup,
+    )
+    h = await harness(
+        [mixed_turn],
+        tools=[listing, lookup_tool(risk=RiskLevel.CRITICAL)],
+        auto_approve_up_to=RiskLevel.WRITE,
+    )
+    await h.runner.run(h.task.id)
+
+    pending = h.runner.pending_approval(await h.repository.get(h.task.id))
+
+    # The whole turn is shown: approving one action while its siblings run
+    # unexamined is not an informed decision.
+    assert [(c.name, c.needs_approval) for c in pending] == [
+        ("list_invoices", False),
+        ("lookup_invoice", True),
+    ]
+    assert [c.risk for c in pending] == [RiskLevel.READ, RiskLevel.CRITICAL]
+    assert pending[1].arguments == {"invoice_id": "INV-2"}
+
+
+async def test_the_approval_view_is_empty_for_a_task_that_is_not_paused() -> None:
+    h = await harness([answer()])
+
+    assert h.runner.pending_approval(h.task) == ()
 
 
 async def test_the_originating_request_id_follows_the_run_into_tool_execution() -> None:

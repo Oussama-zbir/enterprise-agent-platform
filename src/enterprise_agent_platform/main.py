@@ -1,9 +1,9 @@
 """FastAPI application entrypoint.
 
 Exposes the application factory and a module-level ``app`` for ASGI servers.
-Wires configuration, logging, request correlation IDs, health, the task API, and
-the agent runner with the tool registry it may call. MCP integration and the
-approval workflow arrive in later milestones.
+Wires configuration, logging, request correlation IDs, health, the task API
+(including the human approval routes), and the agent runner with the tool
+registry it may call. MCP integration arrives in a later milestone.
 """
 
 from __future__ import annotations

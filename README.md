@@ -2,16 +2,17 @@
 
 A production-oriented platform for building and operating enterprise AI agents.
 
-> **Status: AI capability.** This repository is being built incrementally. It
-> has an engineering foundation (config, structured logging with request
+> **Status: human-in-the-loop.** This repository is being built incrementally.
+> It has an engineering foundation (config, structured logging with request
 > correlation IDs, strict typing, tests, Docker, CI), a task domain (an explicit
 > agent-task lifecycle, a storage port with optimistic concurrency, and a
 > `/tasks` API), an LLM layer (a provider port with a real Anthropic / Bedrock
 > adapter behind it, including tool calling), a tool layer (typed tools with risk
-> metadata, validated arguments, and bounded execution), and the agent runner
-> that drives a task through model and tool calls under a step budget. MCP
-> integration, human-in-the-loop approval, and evaluation are planned milestones
-> (see [Roadmap](#roadmap)).
+> metadata, validated arguments, and bounded execution), the agent runner that
+> drives a task through model and tool calls under a step budget, and a working
+> approval loop: a run that reaches a risky tool pauses, checkpoints itself, and
+> continues from that checkpoint when a human approves it. MCP integration and
+> evaluation are planned milestones (see [Roadmap](#roadmap)).
 
 ## Problem statement
 
@@ -44,7 +45,7 @@ agent capabilities on top without disturbing the operational base.
                 |            +--> LLMClient --> provider port      |
                 |            +--> ToolRegistry (typed tools)       |
                 |            +--> MCP (later)                      |
-                |            +--> human-in-the-loop (later)        |
+                |            +--> approval + checkpoint/resume     |
                 |                                                  |
                 |  cross-cutting: config · JSON logging ·          |
                 |  X-Request-ID correlation · tracing (later)      |
@@ -59,7 +60,7 @@ Current modules:
 | `enterprise_agent_platform.logging`    | Structured JSON logging to stdout               |
 | `...request_context`                   | `X-Request-ID` middleware, request access logs  |
 | `enterprise_agent_platform.main`       | App factory, lifespan, `/health`, router wiring |
-| `...tasks.models`                      | `AgentTask` model and lifecycle state machine   |
+| `...tasks.models`                      | `AgentTask`, lifecycle state machine, checkpoint |
 | `...tasks.repository`                  | `TaskRepository` port + in-memory adapter       |
 | `...tasks.service`                     | Load → transition → persist use case            |
 | `...tasks.router`                      | `/tasks` HTTP routes and API schemas            |
@@ -71,7 +72,7 @@ Current modules:
 | `...llm.factory`                       | Backend selection from settings                 |
 | `...tools.models`                      | Typed tool definitions and risk levels          |
 | `...tools.registry`                    | Tool lookup, validation, bounded execution      |
-| `...agent.runner`                      | The run loop: model calls, tools, budgets        |
+| `...agent.runner`                      | The run loop: model calls, tools, budgets, approval |
 
 ### Task lifecycle
 
@@ -208,6 +209,36 @@ and the approval workflow cannot disagree about what is legal.
   and the task moves to `awaiting_approval`. Executing the rest would mean
   reconstructing a partially applied turn on approval, and the remaining calls
   may depend on the paused one.
+- **A pause checkpoints the run, so approval continues it instead of restarting
+  it.** The conversation so far, the steps spent, the tool calls made, and the
+  tokens burned are stored on the task as a `RunCheckpoint`. Restarting on
+  approval would re-ask the model what it has already answered, re-run tools
+  that already ran, and quietly reset the step budget — so a task could be
+  paused and approved its way past `EAP_AGENT_MAX_STEPS` indefinitely.
+- **The checkpoint lives on the task, not in a second store.** Approving,
+  rejecting, and cancelling all decide the same thing — what this task does next
+  — and the version check exists to make exactly one of them win. Splitting run
+  state into its own store would allow a task in `awaiting_approval` with no
+  conversation behind it, a state nothing can act on. Every transition rewrites
+  the checkpoint and clears it by default, so a resumed or finished task cannot
+  carry a stale conversation that a later approval replays.
+- **Resuming re-checks the version the approver read.** `/approve` reads the
+  checkpoint, then transitions; `transition_task` takes the version from that
+  read, so a second approver or a cancellation landing in between produces a 409
+  rather than a second agent replaying the same critical calls.
+- **Rejection ends the task; it is not fed back to the model.** Returning a
+  denial as a recoverable tool error would invite the agent to route around a
+  decision a human just made, which is exactly what an approval gate exists to
+  prevent. The rejection is recorded with who made it, and the checkpoint is
+  dropped so the denied calls cannot be replayed.
+- **Approval is a view, not just a verb.** `GET /tasks/{id}/approval` shows the
+  whole held turn with each call's arguments and risk, and marks which ones
+  tripped the gate — approving a tool by name alone is theatre, and approving
+  one action while its siblings run unexamined is not an informed decision. The
+  view reads the same threshold the pause did, so it cannot disagree with what
+  the run will do. The checkpoint itself is never exposed on `GET /tasks/{id}`:
+  it carries model output and tool results, and this is the only slice of it
+  anyone needs to act on.
 - **Agent failures are outcomes, not exceptions.** A provider error, a refusal,
   a truncated answer, an exhausted budget — each ends with the task in `failed`
   and a reason in its history; only genuine lifecycle errors (unknown task, task
@@ -307,13 +338,37 @@ The run drives the task: `pending -> running -> completed | failed`, or
 Running the same task twice returns 409. The platform ships with no tools of its
 own; a deployment registers its own through `create_app(tool_registry=...)`.
 
-| Method & path              | Result                                                  |
-| -------------------------- | ------------------------------------------------------- |
-| `POST /tasks`              | 201 pending task; 422 on invalid or unknown fields      |
-| `GET /tasks`               | Newest first; optional `status` filter, `limit` 1–200   |
-| `GET /tasks/{id}`          | 200, or 404 if unknown                                  |
-| `POST /tasks/{id}/run`     | 200 with the run outcome; 404 unknown; 409 not pending  |
-| `POST /tasks/{id}/cancel`  | 200; 404 unknown; 409 terminal task or concurrent write |
+Approve or reject what a paused run wants to do:
+
+```bash
+curl -s http://127.0.0.1:8000/tasks/<uuid>/approval
+# {"task_id":"<uuid>","goal":"Settle invoice INV-1","status":"awaiting_approval",
+#  "paused_at":"...","detail":"approval required for: pay_invoice",
+#  "pending_tool_calls":[{"id":"call_1","name":"pay_invoice",
+#    "arguments":{"invoice_id":"INV-1"},"risk":"critical","needs_approval":true}]}
+
+curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/approve \
+  -H 'Content-Type: application/json' \
+  -d '{"approved_by": "manager-2", "note": "supplier verified"}'
+# the held calls run, the run continues from its checkpoint, and the response is
+# a run outcome whose steps/tokens cover the whole run, pause included
+
+curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/reject \
+  -H 'Content-Type: application/json' \
+  -d '{"rejected_by": "manager-2", "reason": "supplier not verified"}'
+# 200 with status "cancelled"; the held calls never run
+```
+
+| Method & path               | Result                                                   |
+| --------------------------- | -------------------------------------------------------- |
+| `POST /tasks`               | 201 pending task; 422 on invalid or unknown fields       |
+| `GET /tasks`                | Newest first; optional `status` filter, `limit` 1–200    |
+| `GET /tasks/{id}`           | 200, or 404 if unknown                                   |
+| `POST /tasks/{id}/run`      | 200 with the run outcome; 404 unknown; 409 not pending   |
+| `GET /tasks/{id}/approval`  | 200 with the held calls; 404 unknown; 409 if not paused  |
+| `POST /tasks/{id}/approve`  | 200 with the resumed run's outcome; 404; 409 if not paused |
+| `POST /tasks/{id}/reject`   | 200 cancelled task; 404 unknown; 409 if not paused       |
+| `POST /tasks/{id}/cancel`   | 200; 404 unknown; 409 terminal task or concurrent write  |
 
 Every response carries an `X-Request-ID` header (the caller's, if well-formed,
 otherwise a generated UUID), and every log line written during that request
@@ -354,7 +409,7 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 3. **AI capability** — LLM provider abstraction, agent orchestration, tool
    calling, MCP integration *(in progress: provider port, client, the Anthropic
    / Bedrock adapter, the tool registry, and the agent run loop done; MCP next)*
-4. **Human-in-the-loop** — approval workflows, structured state
+4. **Human-in-the-loop** — approval workflows, structured state ✅
 5. **Evaluation** — agent evaluation harness and metrics
 6. **Observability** — tracing, latency/cost accounting (OpenTelemetry)
 7. **Reliability & security** — retries, rate limits, prompt-injection defense
@@ -364,10 +419,12 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 
 Agent runs execute inside the API process while the caller waits, so a long run
 holds an HTTP connection and a restart loses it; moving execution behind a queue
-needs durable tasks first. A run that pauses for approval stops there: the
-conversation is not persisted, so resuming an approved task is part of the
-human-in-the-loop milestone, together with the approve/reject endpoints. No
-tools ship with the platform — a deployment registers its own — so an
+needs durable tasks first. The same applies to a paused run: its checkpoint is
+durable only as far as the repository is, so with the in-memory adapter an
+approval cannot outlive a restart. Approvals are recorded, not authenticated —
+`approved_by` is caller-supplied until the platform has auth, so today it is an
+audit field rather than an authorization one, and any caller can approve any
+task. No tools ship with the platform — a deployment registers its own — so an
 out-of-the-box run is a single model call. The adapter is tested against a mock
 HTTP transport rather than the live API, and does not cover streaming or prompt
 caching. Tasks are stored in process memory, so they are lost on restart and are
