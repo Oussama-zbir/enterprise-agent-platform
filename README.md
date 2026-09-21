@@ -37,7 +37,7 @@ agent capabilities on top without disturbing the operational base.
                 |      v                                           |
                 |  task service  -->  TaskRepository (port)        |
                 |      |                  +--> in-memory adapter   |
-                |      |                  +--> database (later)    |
+                |      |                  +--> PostgreSQL adapter  |
                 |      v                                           |
                 |  AgentTask state machine                         |
                 |      ^                                           |
@@ -121,8 +121,38 @@ and the approval workflow cannot disagree about what is legal.
 - **Optimistic concurrency in the repository.** `update()` takes the version the
   caller read and fails with `ConcurrentUpdateError` (HTTP 409) if the task has
   moved on. This avoids lost updates when, say, an approval and a cancellation
-  race, without holding locks across slow LLM or human steps. A database
-  adapter maps this to `UPDATE ... WHERE id = :id AND version = :expected`.
+  race, without holding locks across slow LLM or human steps. The PostgreSQL
+  adapter maps this to `UPDATE ... WHERE id = $1 AND version = $7`, so the check
+  and the write are one statement evaluated under the row lock.
+- **Two repository adapters, one contract test suite.** The in-memory and
+  PostgreSQL adapters run the same tests (`tests/test_task_repository.py`);
+  anything an adapter may differ on is deliberately not in them. The PostgreSQL
+  parameters skip unless `EAP_TEST_DATABASE_URL` is set, so the default suite
+  stays offline, and CI runs them against a real server — including a test where
+  two writes on the same version are issued concurrently, which is the only way
+  to catch a version check implemented as two statements.
+- **`history` and `checkpoint` are `jsonb` columns, not child tables.** Both are
+  only ever read with their task and never queried across tasks, so inlining
+  them keeps a transition to a single statement — the same one that performs the
+  version check. Child tables would buy queries nobody makes in exchange for a
+  multi-statement write whose atomicity then depends on the transaction.
+- **The domain's checkpoint invariant is restated as a table constraint.** Only
+  an `awaiting_approval` task may carry run state; a `CHECK` enforces it in the
+  database, so a future writer that bypasses the model still cannot leave a
+  replayable conversation on a finished task. The status `CHECK` list is
+  generated from the `TaskStatus` enum so the two cannot drift.
+- **Rows are validated back through the domain model on read.** A task written
+  by an older build, or edited by hand, has to satisfy the state machine's
+  invariants before anything acts on it.
+- **Schema creation is not application startup.** `apply_schema` is idempotent
+  DDL for local development and tests (`python -m
+  enterprise_agent_platform.tasks.postgres`); the service itself never holds DDL
+  privileges, and a real deployment substitutes a migration tool.
+- **The store is deployment configuration, not application logic.**
+  `EAP_TASK_STORE` selects the adapter, `memory` is rejected in production
+  (a restart would strand an approval that has already been made), and
+  `postgres` without a URL fails at startup rather than on the first write. The
+  driver import is deferred, so asyncpg stays an optional dependency.
 - **Repository as a `Protocol` port, in-memory adapter first.** Persistence
   technology is deferred until orchestration shows the real access patterns;
   the adapter is injected through `create_app(task_repository=...)`.
@@ -265,6 +295,7 @@ and the approval workflow cannot disagree about what is legal.
 - FastAPI + Uvicorn
 - Anthropic SDK (Messages API, first-party or Bedrock)
 - Pydantic v2 / pydantic-settings
+- PostgreSQL (asyncpg), optional — in-memory store by default
 - pytest + pytest-asyncio
 - Ruff (lint + format), mypy (strict)
 - Docker, GitHub Actions
@@ -289,6 +320,19 @@ EAP_LLM_PROVIDER=anthropic EAP_ANTHROPIC_API_KEY=sk-ant-... EAP_LLM_MODEL=claude
 
 # Bedrock — credentials come from the standard AWS chain
 EAP_LLM_PROVIDER=bedrock EAP_AWS_REGION=eu-west-1 EAP_LLM_MODEL=anthropic.claude-opus-5
+```
+
+Tasks are held in memory by default, which is lost on restart. For a durable
+store, install the extra and point the service at PostgreSQL:
+
+```bash
+pip install -e ".[dev,postgres]"
+
+export EAP_TASK_STORE=postgres
+export EAP_DATABASE_URL=postgresql://eap:eap@localhost:5432/eap
+
+# Create the table and indexes once (stands in for a migration tool)
+python -m enterprise_agent_platform.tasks.postgres
 ```
 
 ## Local development
@@ -392,7 +436,15 @@ mypy                  # static type checking (strict)
 pytest -v             # tests
 ```
 
-All four run in CI on Python 3.12 and 3.13.
+All four run in CI on Python 3.12 and 3.13. The repository contract tests are
+skipped against PostgreSQL unless a database is named:
+
+```bash
+EAP_TEST_DATABASE_URL=postgresql://eap:eap@localhost:5432/eap_test \
+  pytest -v tests/test_task_repository.py
+```
+
+CI runs them in a second job against a `postgres:17` service container.
 
 ## Docker
 
@@ -410,25 +462,28 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
    calling, MCP integration *(in progress: provider port, client, the Anthropic
    / Bedrock adapter, the tool registry, and the agent run loop done; MCP next)*
 4. **Human-in-the-loop** — approval workflows, structured state ✅
-5. **Evaluation** — agent evaluation harness and metrics
-6. **Observability** — tracing, latency/cost accounting (OpenTelemetry)
-7. **Reliability & security** — retries, rate limits, prompt-injection defense
-8. **Deployment** — cloud-oriented deployment and infrastructure
+5. **Persistence** — durable task store *(PostgreSQL adapter done; background
+   execution so a run survives a restart is next)*
+6. **Evaluation** — agent evaluation harness and metrics
+7. **Observability** — tracing, latency/cost accounting (OpenTelemetry)
+8. **Reliability & security** — retries, rate limits, prompt-injection defense
+9. **Deployment** — cloud-oriented deployment and infrastructure
 
 ## Limitations
 
 Agent runs execute inside the API process while the caller waits, so a long run
-holds an HTTP connection and a restart loses it; moving execution behind a queue
-needs durable tasks first. The same applies to a paused run: its checkpoint is
-durable only as far as the repository is, so with the in-memory adapter an
-approval cannot outlive a restart. Approvals are recorded, not authenticated —
+holds an HTTP connection and a restart loses the run itself — the task and its
+checkpoint now survive, but the in-flight execution does not, so a run
+interrupted mid-flight stays `running` with nothing driving it. Moving execution
+behind a queue is the next milestone. Approvals are recorded, not authenticated —
 `approved_by` is caller-supplied until the platform has auth, so today it is an
 audit field rather than an authorization one, and any caller can approve any
 task. No tools ship with the platform — a deployment registers its own — so an
 out-of-the-box run is a single model call. The adapter is tested against a mock
 HTTP transport rather than the live API, and does not cover streaming or prompt
-caching. Tasks are stored in process memory, so they are lost on restart and are
-not shared across multiple workers or replicas. There is no authentication yet,
+caching. The PostgreSQL adapter is exercised by the contract suite in CI but has
+no migration tool behind it yet, and the default store is still in-memory, which
+is per-process and lost on restart. There is no authentication yet,
 so `requested_by` is caller-supplied and not verified.
 
 ## License

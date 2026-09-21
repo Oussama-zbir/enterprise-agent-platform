@@ -22,7 +22,8 @@ from enterprise_agent_platform.llm.client import LLMClient
 from enterprise_agent_platform.llm.factory import build_llm_client
 from enterprise_agent_platform.logging import configure_logging
 from enterprise_agent_platform.request_context import RequestContextMiddleware
-from enterprise_agent_platform.tasks.repository import InMemoryTaskRepository, TaskRepository
+from enterprise_agent_platform.tasks.factory import build_task_repository
+from enterprise_agent_platform.tasks.repository import ManagedRepository, TaskRepository
 from enterprise_agent_platform.tasks.router import router as tasks_router
 from enterprise_agent_platform.tools.registry import ToolRegistry
 
@@ -40,15 +41,26 @@ class HealthResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Configure logging on startup and log lifecycle events."""
+    """Configure logging, open pooled resources, and log lifecycle events."""
     settings = get_settings()
     configure_logging(settings.log_level)
-    logger.info("service.startup", extra={"environment": settings.environment})
+    repository = app.state.task_repository
+    if isinstance(repository, ManagedRepository):
+        # A pooled adapter needs a running event loop, so its pool cannot be
+        # opened in the constructor. Doing it here also means an unreachable
+        # database fails startup instead of the first request that touches it.
+        await repository.connect()
+    logger.info(
+        "service.startup",
+        extra={"environment": settings.environment, "task_store": settings.task_store},
+    )
     try:
         yield
     finally:
         # Releases the model backend's HTTP connection pool.
         await app.state.llm_client.aclose()
+        if isinstance(repository, ManagedRepository):
+            await repository.aclose()
         logger.info("service.shutdown")
 
 
@@ -60,7 +72,7 @@ def create_app(
     """Build and configure a FastAPI application instance.
 
     The three adapters are injectable (tests, alternative deployments) and
-    default to the in-memory repository, the model backend named by
+    default to the store named by ``EAP_TASK_STORE``, the model backend named by
     ``EAP_LLM_PROVIDER``, and an empty tool registry. An empty registry is a
     deliberate default: a deployment declares the tools its agents may use, so
     the platform ships with no capabilities of its own.
@@ -72,7 +84,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.task_repository = (
-        task_repository if task_repository is not None else InMemoryTaskRepository()
+        task_repository if task_repository is not None else build_task_repository(settings)
     )
     app.state.llm_client = llm_client if llm_client is not None else build_llm_client(settings)
     app.state.tool_registry = tool_registry if tool_registry is not None else ToolRegistry()

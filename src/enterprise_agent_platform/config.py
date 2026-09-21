@@ -17,6 +17,7 @@ from enterprise_agent_platform.tools.models import RiskLevel
 Environment = Literal["development", "staging", "production", "test"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 LLMProviderName = Literal["fake", "anthropic", "bedrock"]
+TaskStoreName = Literal["memory", "postgres"]
 
 
 class Settings(BaseSettings):
@@ -70,11 +71,56 @@ class Settings(BaseSettings):
         description="Highest tool risk an agent may run unattended; above it, a human decides.",
     )
 
+    task_store: TaskStoreName = Field(
+        default="memory",
+        description="Task persistence backend. 'memory' is per-process and lost on restart.",
+    )
+    database_url: SecretStr | None = Field(
+        default=None,
+        description="postgresql://user:password@host:5432/database, for task_store='postgres'.",
+    )
+    database_pool_min_size: int = Field(
+        default=1, ge=0, description="Connections kept open per process."
+    )
+    database_pool_max_size: int = Field(
+        default=10,
+        ge=1,
+        description="Connection ceiling per process; replicas multiply it against the server's.",
+    )
+    database_command_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description="Deadline for a single statement, so a blocked write fails instead of hanging.",
+    )
+
     @model_validator(mode="after")
     def _require_a_real_provider_in_production(self) -> Settings:
         """Fail at startup rather than on the first customer request."""
         if self.environment == "production" and self.llm_provider == "fake":
             raise ValueError("EAP_LLM_PROVIDER=fake is not usable in production")
+        return self
+
+    @model_validator(mode="after")
+    def _require_a_durable_store_in_production(self) -> Settings:
+        """A production deployment must not hold task state in one process.
+
+        Since tasks carry the checkpoint a human approval resumes from, an
+        in-memory store in production means a restart can strand a decision
+        that has already been made.
+        """
+        if self.environment == "production" and self.task_store == "memory":
+            raise ValueError("EAP_TASK_STORE=memory is not usable in production")
+        return self
+
+    @model_validator(mode="after")
+    def _database_settings_are_consistent(self) -> Settings:
+        if self.task_store == "postgres" and self.database_url is None:
+            raise ValueError("EAP_TASK_STORE=postgres requires EAP_DATABASE_URL")
+        if self.database_pool_max_size < self.database_pool_min_size:
+            raise ValueError(
+                "EAP_DATABASE_POOL_MAX_SIZE must be greater than or equal to "
+                "EAP_DATABASE_POOL_MIN_SIZE"
+            )
         return self
 
 

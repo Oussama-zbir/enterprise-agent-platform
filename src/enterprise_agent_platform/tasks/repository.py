@@ -11,7 +11,7 @@ tests; a database-backed adapter can replace it without changing callers.
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from enterprise_agent_platform.tasks.models import AgentTask, TaskStatus
@@ -48,6 +48,21 @@ class TaskRepository(Protocol):
     ) -> list[AgentTask]: ...
 
 
+@runtime_checkable
+class ManagedRepository(Protocol):
+    """A repository that owns a resource the application must open and close.
+
+    Kept separate from ``TaskRepository`` so the port stays about storage: a
+    dict needs no connection pool, and callers doing task work should not have
+    to care which kind they were handed. Only the application lifespan checks
+    for this.
+    """
+
+    async def connect(self) -> None: ...
+
+    async def aclose(self) -> None: ...
+
+
 class InMemoryTaskRepository:
     """Dict-backed repository.
 
@@ -82,4 +97,8 @@ class InMemoryTaskRepository:
         self, *, status: TaskStatus | None = None, limit: int = 50
     ) -> list[AgentTask]:
         matching = (t for t in self._tasks.values() if status is None or t.status is status)
-        return sorted(matching, key=lambda t: t.created_at, reverse=True)[:limit]
+        # The id breaks ties on identical timestamps so the order is total and
+        # matches the SQL adapter's `ORDER BY created_at DESC, id DESC`. Without
+        # it, two tasks created in the same instant could swap places between
+        # calls — which is exactly what makes keyset pagination unsound.
+        return sorted(matching, key=lambda t: (t.created_at, t.id), reverse=True)[:limit]
