@@ -1,5 +1,7 @@
 # Enterprise Agent Platform
 
+[![M8ven Verified](https://m8ven.ai/badge/mcp/oussama-zbir/enterprise-agent-platform?variant=verified)](https://m8ven.ai/mcp/oussama-zbir/enterprise-agent-platform)
+
 A production-oriented platform for building and operating enterprise AI agents.
 
 > **Status: human-in-the-loop.** This repository is being built incrementally.
