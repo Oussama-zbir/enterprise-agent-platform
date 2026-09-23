@@ -13,8 +13,10 @@ A production-oriented platform for building and operating enterprise AI agents.
 > metadata, validated arguments, and bounded execution), the agent runner that
 > drives a task through model and tool calls under a step budget, and a working
 > approval loop: a run that reaches a risky tool pauses, checkpoints itself, and
-> continues from that checkpoint when a human approves it. MCP integration and
-> evaluation are planned milestones (see [Roadmap](#roadmap)).
+> continues from that checkpoint when a human approves it. Tools can also come
+> from an external MCP server, adapted into the same typed tool layer and
+> classified for risk locally. Evaluation and background execution are planned
+> milestones (see [Roadmap](#roadmap)).
 
 ## Problem statement
 
@@ -46,7 +48,7 @@ agent capabilities on top without disturbing the operational base.
                 |      +-- AgentRunner (model <-> tool loop)       |
                 |            +--> LLMClient --> provider port      |
                 |            +--> ToolRegistry (typed tools)       |
-                |            +--> MCP (later)                      |
+                |            +--> MCP client --> transport port    |
                 |            +--> approval + checkpoint/resume     |
                 |                                                  |
                 |  cross-cutting: config · JSON logging ·          |
@@ -75,6 +77,12 @@ Current modules:
 | `...tools.models`                      | Typed tool definitions and risk levels          |
 | `...tools.registry`                    | Tool lookup, validation, bounded execution      |
 | `...agent.runner`                      | The run loop: model calls, tools, budgets, approval |
+| `...mcp.protocol`                      | MCP wire types and failure taxonomy             |
+| `...mcp.transport`                     | `MCPTransport` port + stdio subprocess adapter  |
+| `...mcp.client`                        | Handshake, tool discovery, `tools/call`         |
+| `...mcp.policy`                        | Server config and locally owned risk mapping    |
+| `...mcp.tools`                         | Remote tools adapted into the tool registry     |
+| `...mcp.factory`                       | Connect configured servers, register their tools |
 
 ### Task lifecycle
 
@@ -291,6 +299,70 @@ and the approval workflow cannot disagree about what is legal.
   variable, so a run handed to a background worker still correlates with the
   request that created the task.
 
+### MCP: remote tools under local risk policy
+
+A deployment can source tools from external MCP servers, declared in
+`EAP_MCP_SERVERS`:
+
+```json
+[
+  {
+    "name": "finance",
+    "command": "python",
+    "args": ["-m", "finance_mcp"],
+    "default_risk": "read",
+    "tool_risk": { "pay_invoice": "critical" }
+  }
+]
+```
+
+Each server is started at application startup, handshaken, and asked for its
+tools; every tool becomes an ordinary `Tool` in the ordinary `ToolRegistry`,
+registered as `finance__pay_invoice`. From there the agent runner, the risk
+gate, the approval workflow, the per-call timeout, and result truncation apply
+to it unchanged — no part of the agent imports anything from the `mcp` package,
+and swapping a local tool for a remote one changes no agent code.
+
+The design decisions worth naming:
+
+- **Risk is decided locally, never read from the server.** Tool discovery
+  happens at runtime against code outside this repository, so a server could
+  otherwise add `transfer_funds` to a running agent, or advertise
+  `readOnlyHint: true` on a payment tool. Risk resolves from a per-tool
+  override, then the server's configured default, then `CRITICAL` — so an
+  unmapped tool is gated rather than waved through. The failure mode of this
+  design is an unnecessary approval prompt; it is never an ungated action.
+- **Server metadata cannot reach the decision.** `MCPToolDeclaration` parses
+  with `extra="ignore"`, so annotations, hints and titles are dropped at the
+  parse boundary. The platform has nowhere to put a server's claim about its own
+  safety, which is what makes the policy unbypassable rather than merely
+  unbypassed. This is the posture the runner already takes toward tool *results*
+  (data, not instructions), extended to tool *declarations*.
+- **The model sees the server's schema; the platform validates with its own.**
+  The server's JSON Schema carries per-property descriptions and constraints
+  that make tool calls land, so it is what is offered to the model. A Pydantic
+  model derived from it does the validating, so a remote handler never receives
+  an unvalidated dictionary. The derived model is deliberately a coarsening —
+  required fields and broad types, nothing else — so it can never reject
+  arguments the schema the model was shown would allow.
+- **Server-side tool failures are data; protocol failures are not.** `isError`
+  on a `tools/call` result becomes `ToolResult(is_error=True)` and the model can
+  correct itself. A dead subprocess or a malformed frame raises instead: the
+  model cannot fix it, and the text can name hosts and commands.
+- **The client bounds what a server can impose.** Tools per server, pages of
+  `tools/list`, characters per result, and bytes per JSON-RPC frame are all
+  capped, because each is otherwise a remote party choosing this platform's
+  context window, per-call cost, or memory ceiling.
+- **The child process inherits no environment.** An MCP server is third-party
+  code with a shell on the host; handing it this process's API keys and database
+  URL because it was started from here is an avoidable credential leak. A
+  deployment passes exactly what the server needs.
+- **The transport is a port.** `MCPTransport` is request/notify/close;
+  `StdioTransport` runs a child process and multiplexes replies by JSON-RPC id
+  so parallel tool calls share one pipe. The whole client is therefore testable
+  against an in-process stub, and the suite also runs a real subprocess server
+  — offline, with no MCP server installed.
+
 ## Technology stack
 
 - Python 3.12+
@@ -461,8 +533,7 @@ docker run --rm -p 8000:8000 enterprise-agent-platform
 2. **Core domain** — task lifecycle, repository port, task API, request
    correlation IDs ✅
 3. **AI capability** — LLM provider abstraction, agent orchestration, tool
-   calling, MCP integration *(in progress: provider port, client, the Anthropic
-   / Bedrock adapter, the tool registry, and the agent run loop done; MCP next)*
+   calling, MCP integration ✅
 4. **Human-in-the-loop** — approval workflows, structured state ✅
 5. **Persistence** — durable task store *(PostgreSQL adapter done; background
    execution so a run survives a restart is next)*
@@ -485,7 +556,11 @@ out-of-the-box run is a single model call. The adapter is tested against a mock
 HTTP transport rather than the live API, and does not cover streaming or prompt
 caching. The PostgreSQL adapter is exercised by the contract suite in CI but has
 no migration tool behind it yet, and the default store is still in-memory, which
-is per-process and lost on restart. There is no authentication yet,
+is per-process and lost on restart. The MCP client speaks stdio only — HTTP and
+SSE transports are not implemented, though they are a second adapter behind the
+same port rather than a change to the client — and tools are discovered once at
+startup, so a server that gains or loses a tool while the process runs is not
+noticed until a restart. There is no authentication yet,
 so `requested_by` is caller-supplied and not verified.
 
 ## License

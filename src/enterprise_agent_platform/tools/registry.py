@@ -8,11 +8,13 @@ with ``is_error`` set, which the orchestrator hands to the model so it can
 correct itself. Raising would end a task that is usually still recoverable.
 Programmer mistakes (registering the same tool twice) still raise.
 
-*What goes back to the model is bounded and scrubbed.* Handler exception
-messages are logged but never returned — they can carry connection strings or
-internal identifiers, and everything returned here re-enters the prompt, where
-it is also a prompt-injection surface. Results are truncated so one chatty tool
-cannot consume the context window.
+*What goes back to the model is bounded and scrubbed.* An unexpected handler
+exception is logged and replaced with a generic message — its text can carry
+connection strings or internal identifiers, and everything returned here
+re-enters the prompt, where it is also a prompt-injection surface. Only
+``ToolExecutionError``, which a handler raises deliberately to describe a
+failure in its own domain, travels back verbatim. Results are truncated so one
+chatty tool cannot consume the context window.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from enterprise_agent_platform.llm.models import ToolCall, ToolResult, ToolSpec
-from enterprise_agent_platform.tools.models import Tool
+from enterprise_agent_platform.tools.models import Tool, ToolExecutionError
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +114,19 @@ class ToolRegistry:
         try:
             async with asyncio.timeout(self._timeout_seconds):
                 output = await tool.handler(arguments)
+        except ToolExecutionError as exc:
+            # The handler is reporting an outcome, not a defect: "no invoice
+            # with that id", "the remote server rejected this call". Its text is
+            # part of the tool's contract, so it goes back to the model — the
+            # same treatment invalid arguments get, and the reason a run can
+            # recover instead of failing the task.
+            return self._failure(
+                call,
+                tool=tool,
+                outcome="tool_error",
+                message=str(exc) or f"Tool '{tool.name}' reported a failure.",
+                duration_ms=_elapsed_ms(started),
+            )
         except TimeoutError:
             return self._failure(
                 call,

@@ -12,6 +12,7 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from enterprise_agent_platform.mcp.policy import MCPServerConfig
 from enterprise_agent_platform.tools.models import RiskLevel
 
 Environment = Literal["development", "staging", "production", "test"]
@@ -71,6 +72,15 @@ class Settings(BaseSettings):
         description="Highest tool risk an agent may run unattended; above it, a human decides.",
     )
 
+    mcp_servers: tuple[MCPServerConfig, ...] = Field(
+        default=(),
+        description=(
+            "MCP servers whose tools the agent may call, as a JSON list. Each entry names the "
+            "server, the command that runs it, and the risk this deployment assigns to its "
+            "tools; risk is never read from the server itself."
+        ),
+    )
+
     task_store: TaskStoreName = Field(
         default="memory",
         description="Task persistence backend. 'memory' is per-process and lost on restart.",
@@ -110,6 +120,14 @@ class Settings(BaseSettings):
         """
         if self.environment == "production" and self.task_store == "memory":
             raise ValueError("EAP_TASK_STORE=memory is not usable in production")
+        return self
+
+    @model_validator(mode="after")
+    def _mcp_server_names_are_unique(self) -> Settings:
+        """Names namespace tools, so a duplicate would make the prefix ambiguous."""
+        names = [server.name for server in self.mcp_servers]
+        if len(set(names)) != len(names):
+            raise ValueError("EAP_MCP_SERVERS entries must have unique names")
         return self
 
     @model_validator(mode="after")
