@@ -11,13 +11,15 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 
 from enterprise_agent_platform import __version__
 from enterprise_agent_platform.agent.runner import AgentRunner
-from enterprise_agent_platform.config import get_settings
+from enterprise_agent_platform.config import Settings, get_settings
+from enterprise_agent_platform.demo.tools import build_demo_tools
 from enterprise_agent_platform.llm.client import LLMClient
 from enterprise_agent_platform.llm.factory import build_llm_client
 from enterprise_agent_platform.logging import configure_logging
@@ -26,6 +28,7 @@ from enterprise_agent_platform.request_context import RequestContextMiddleware
 from enterprise_agent_platform.tasks.factory import build_task_repository
 from enterprise_agent_platform.tasks.repository import ManagedRepository, TaskRepository
 from enterprise_agent_platform.tasks.router import router as tasks_router
+from enterprise_agent_platform.tools.models import Tool
 from enterprise_agent_platform.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -76,6 +79,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("service.shutdown")
 
 
+def _configured_tools(settings: Settings) -> tuple[Tool[Any], ...]:
+    """The tools a deployment gets without registering any itself.
+
+    None, unless it asked for the demo set: a platform that grants capabilities
+    by default grants them to every agent running on it.
+    """
+    return build_demo_tools() if settings.demo_tools else ()
+
+
 def create_app(
     task_repository: TaskRepository | None = None,
     llm_client: LLMClient | None = None,
@@ -85,11 +97,13 @@ def create_app(
 
     The three adapters are injectable (tests, alternative deployments) and
     default to the store named by ``EAP_TASK_STORE``, the model backend named by
-    ``EAP_LLM_PROVIDER``, and an empty tool registry. An empty registry is a
-    deliberate default: a deployment declares the tools its agents may use, so
-    the platform ships with no capabilities of its own. The tools published by
-    the servers in ``EAP_MCP_SERVERS`` are added to that registry during
-    startup, once an event loop exists to connect them over.
+    ``EAP_LLM_PROVIDER``, and a registry holding only what configuration asked
+    for. An empty registry is the deliberate default: a deployment declares the
+    tools its agents may use, so the platform ships with no capabilities of its
+    own. ``EAP_DEMO_TOOLS`` adds the synthetic demo set so the platform can be
+    run end to end out of the box, and the tools published by the servers in
+    ``EAP_MCP_SERVERS`` are added to the registry during startup, once an event
+    loop exists to connect them over.
     """
     settings = get_settings()
     app = FastAPI(
@@ -101,7 +115,9 @@ def create_app(
         task_repository if task_repository is not None else build_task_repository(settings)
     )
     app.state.llm_client = llm_client if llm_client is not None else build_llm_client(settings)
-    app.state.tool_registry = tool_registry if tool_registry is not None else ToolRegistry()
+    app.state.tool_registry = (
+        tool_registry if tool_registry is not None else ToolRegistry(_configured_tools(settings))
+    )
     app.state.mcp_connections = MCPConnections()
     app.state.agent_runner = AgentRunner(
         app.state.llm_client,

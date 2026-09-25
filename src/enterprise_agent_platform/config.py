@@ -17,7 +17,7 @@ from enterprise_agent_platform.tools.models import RiskLevel
 
 Environment = Literal["development", "staging", "production", "test"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
-LLMProviderName = Literal["fake", "anthropic", "bedrock"]
+LLMProviderName = Literal["fake", "demo", "anthropic", "bedrock"]
 TaskStoreName = Literal["memory", "postgres"]
 
 
@@ -41,7 +41,10 @@ class Settings(BaseSettings):
 
     llm_provider: LLMProviderName = Field(
         default="fake",
-        description="Model backend. 'fake' is offline only: every call raises.",
+        description=(
+            "Model backend. 'fake' is offline only: every call raises. 'demo' is the "
+            "scripted stand-in that drives the shipped demo without an API key."
+        ),
     )
     llm_model: str = Field(
         default="claude-opus-5",
@@ -70,6 +73,14 @@ class Settings(BaseSettings):
     agent_auto_approve_up_to: RiskLevel = Field(
         default=RiskLevel.READ,
         description="Highest tool risk an agent may run unattended; above it, a human decides.",
+    )
+
+    demo_tools: bool = Field(
+        default=False,
+        description=(
+            "Register the synthetic accounts-payable tools so the platform can be run "
+            "end to end out of the box. Never enable in a real deployment."
+        ),
     )
 
     mcp_servers: tuple[MCPServerConfig, ...] = Field(
@@ -106,8 +117,20 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _require_a_real_provider_in_production(self) -> Settings:
         """Fail at startup rather than on the first customer request."""
-        if self.environment == "production" and self.llm_provider == "fake":
-            raise ValueError("EAP_LLM_PROVIDER=fake is not usable in production")
+        if self.environment == "production" and self.llm_provider in {"fake", "demo"}:
+            raise ValueError(f"EAP_LLM_PROVIDER={self.llm_provider} is not usable in production")
+        return self
+
+    @model_validator(mode="after")
+    def _keep_the_demo_out_of_production(self) -> Settings:
+        """The demo tools move synthetic money; nothing real should offer them.
+
+        They exist to make the approval gate reproducible, which means they are
+        registered by configuration rather than by code — and a flag that can
+        turn on capabilities is a flag that has to be refused somewhere.
+        """
+        if self.environment == "production" and self.demo_tools:
+            raise ValueError("EAP_DEMO_TOOLS=true is not usable in production")
         return self
 
     @model_validator(mode="after")

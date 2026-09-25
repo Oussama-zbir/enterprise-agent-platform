@@ -409,6 +409,85 @@ export EAP_DATABASE_URL=postgresql://eap:eap@localhost:5432/eap
 python -m enterprise_agent_platform.tasks.postgres
 ```
 
+## Demo — run the approval flow, offline
+
+The platform ships no tools of its own, so a deployment declares what its agents
+may do. `src/enterprise_agent_platform/demo/` is one such deployment: synthetic
+accounts-payable data, four tools spanning the risk range (`lookup_invoice` and
+`list_overdue_invoices` are `read`, `add_invoice_note` is `write`, `pay_invoice`
+is `critical`), and a scripted stand-in for a model. No API key, no network, no
+database:
+
+```bash
+python -m enterprise_agent_platform.demo
+```
+
+It drives the real application over HTTP through an in-process ASGI transport
+and prints every call, so the transcript is the system rather than a
+description of it:
+
+```
+# 2. Run it. The agent reads the invoice unattended, then asks to pay it —
+#    'pay_invoice' is CRITICAL, above EAP_AGENT_AUTO_APPROVE_UP_TO=read,
+#    so the whole turn stops and the task parks in 'awaiting_approval'.
+$ curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/run
+{"message": "tool.call.completed", "tool": "lookup_invoice", "risk": "read", "outcome": "ok", ...}
+{"message": "agent.run.completed", "status": "awaiting_approval", "steps": 2, "tool_calls": 1,
+ "input_tokens": 565, "output_tokens": 20, "duration_ms": 1.11, "request_id": "9a998cef-..."}
+{
+  "task": { "status": "awaiting_approval", "version": 3, ... },
+  "detail": "approval required for: pay_invoice",
+  "steps": 2, "tool_calls": 1, "input_tokens": 565, "output_tokens": 20,
+  "pending_tool_calls": ["pay_invoice"]
+}
+
+# 3. Show the approver the decision: which calls are held, with the
+#    arguments they would run with and the risk that stopped them.
+$ curl -s -X GET http://127.0.0.1:8000/tasks/<uuid>/approval
+{
+  "goal": "Settle invoice INV-1043 with the supplier, in full.",
+  "status": "awaiting_approval", "detail": "approval required for: pay_invoice",
+  "pending_tool_calls": [{"id": "demo_2_0", "name": "pay_invoice",
+    "arguments": {"invoice_id": "INV-1043", "amount_eur": "1284.50"},
+    "risk": "critical", "needs_approval": true}]
+}
+
+# 4. Approve. The held call runs and the *same* run continues from its
+#    checkpoint: the counters below cover the whole run, pause included.
+$ curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/approve \
+    -d '{"approved_by": "finance-manager-2", "note": "supplier and amount verified"}'
+{ "task": {"status": "completed", "version": 5, ...},
+  "detail": "agent run completed",
+  "steps": 3, "tool_calls": 2, "input_tokens": 909, "output_tokens": 109 }
+```
+
+The walkthrough also checks its own story — the run must pause on the critical
+tool, the approval must continue the paused run's step budget rather than reset
+it, and the ledger must end with exactly one payment — so it exits non-zero if
+the platform stops behaving the way the transcript says it does. The same code
+path runs as a test (`tests/test_demo.py`) on every CI build, which is what
+keeps this section from drifting away from the system.
+
+Set `EAP_LOG_LEVEL=WARNING` for a transcript without the interleaved service
+logs, or run the same deployment under uvicorn and curl it yourself:
+
+```bash
+EAP_LLM_PROVIDER=demo EAP_DEMO_TOOLS=true uvicorn enterprise_agent_platform.main:app
+```
+
+Both settings are refused when `EAP_ENVIRONMENT=production`: a flag that turns
+on capabilities is a flag that has to be refused somewhere.
+
+Two things in that transcript are the demo's, not the platform's. The scripted
+provider is a stand-in for a model — it matches the goal to one of two planned
+scenarios and reads each turn's arguments out of the previous turn's tool
+results, so the run is still driven by what the tools returned, but it is not
+reasoning. And token counts are estimated from character length rather than
+tokenized. Everything else — the loop, the risk gate, the pause, the
+checkpoint, the resumed budget, the audit history, the logs — is the real
+system. Point `EAP_LLM_PROVIDER` at `anthropic` and the same tools run against
+a real model with nothing else changed.
+
 ## Local development
 
 Run the service:
@@ -446,7 +525,7 @@ Run a task with the agent loop:
 curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/run
 # {"task":{"status":"completed","version":3,"history":[...]},
 #  "output":"...", "detail":"agent run completed",
-#  "steps":2, "tool_calls":1, "input_tokens":812, "output_tokens":96,
+#  "steps":3, "tool_calls":2, "input_tokens":909, "output_tokens":109,
 #  "pending_tool_calls":[]}
 ```
 
@@ -454,7 +533,9 @@ The run drives the task: `pending -> running -> completed | failed`, or
 `awaiting_approval` when the model asks for a tool riskier than
 `EAP_AGENT_AUTO_APPROVE_UP_TO` (then `pending_tool_calls` names what it wants).
 Running the same task twice returns 409. The platform ships with no tools of its
-own; a deployment registers its own through `create_app(tool_registry=...)`.
+own: a deployment registers them through `create_app(tool_registry=...)`, points
+`EAP_MCP_SERVERS` at an MCP server, or sets `EAP_DEMO_TOOLS=true` for the
+synthetic set above.
 
 Approve or reject what a paused run wants to do:
 
@@ -551,8 +632,10 @@ interrupted mid-flight stays `running` with nothing driving it. Moving execution
 behind a queue is the next milestone. Approvals are recorded, not authenticated —
 `approved_by` is caller-supplied until the platform has auth, so today it is an
 audit field rather than an authorization one, and any caller can approve any
-task. No tools ship with the platform — a deployment registers its own — so an
-out-of-the-box run is a single model call. The adapter is tested against a mock
+task. No tools ship with the platform for real use — a deployment registers its
+own — so an out-of-the-box run offers the agent nothing unless `EAP_DEMO_TOOLS`
+turns on the synthetic demo set, whose data is entirely fictional and whose
+payments move nothing. The adapter is tested against a mock
 HTTP transport rather than the live API, and does not cover streaming or prompt
 caching. The PostgreSQL adapter is exercised by the contract suite in CI but has
 no migration tool behind it yet, and the default store is still in-memory, which

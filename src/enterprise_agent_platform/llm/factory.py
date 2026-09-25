@@ -10,6 +10,7 @@ from __future__ import annotations
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrockMantle
 
 from enterprise_agent_platform.config import Settings
+from enterprise_agent_platform.demo.provider import DemoLLMProvider
 from enterprise_agent_platform.llm.anthropic_provider import AnthropicProvider, AsyncAnthropicClient
 from enterprise_agent_platform.llm.client import LLMClient
 from enterprise_agent_platform.llm.provider import FakeLLMProvider, LLMProvider
@@ -46,6 +47,10 @@ def _build_provider(settings: Settings) -> LLMProvider:
         # Offline placeholder: an unscripted call fails loudly rather than
         # silently returning something that looks like a model response.
         return FakeLLMProvider([])
+    if settings.llm_provider == "demo":
+        # Offline too, but scripted to drive the demo tools: the run loop, the
+        # risk gate and the approval pause all execute for real.
+        return DemoLLMProvider()
     return AnthropicProvider(
         build_anthropic_client(settings),
         model=settings.llm_model,
