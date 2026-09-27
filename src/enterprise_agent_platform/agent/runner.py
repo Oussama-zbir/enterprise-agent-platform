@@ -214,9 +214,12 @@ class AgentRunner:
             task = await transition_task(
                 self._repository, task_id, TaskStatus.RUNNING, reason="agent run started"
             )
-            # The goal is the only task field put in front of the model:
-            # `requested_by` is caller-supplied and unverified, so it stays out
-            # of the prompt.
+            # The goal is the only task field put in front of the model.
+            # `requested_by` is now authenticated, but identity in a prompt is
+            # an authorisation claim the model is in no position to check, and a
+            # model that reads who asked can be talked into deferring to it.
+            # Authority is decided by scopes and by the approval policy, outside
+            # the conversation.
             opening = Message(role=Role.USER, content=f"Task goal:\n{task.goal}")
             return await self._drive(task.id, [opening], _RunState())
 

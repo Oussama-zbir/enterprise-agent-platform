@@ -14,6 +14,7 @@ from enterprise_agent_platform.main import create_app
 from enterprise_agent_platform.tasks.repository import InMemoryTaskRepository
 from enterprise_agent_platform.tools.models import RiskLevel, Tool
 from enterprise_agent_platform.tools.registry import ToolRegistry
+from tests.credentials import AUTHENTICATOR, authorized
 
 
 class PayArgs(BaseModel):
@@ -36,11 +37,12 @@ PAY_TOOL = Tool(
 def build_client(
     script: list[Completion], *, tools: list[Tool[PayArgs]] | None = None
 ) -> TestClient:
-    return TestClient(
+    return authorized(
         create_app(
             task_repository=InMemoryTaskRepository(),
             llm_client=LLMClient(FakeLLMProvider(script), timeout_seconds=5),
             tool_registry=ToolRegistry(tools or []),
+            authenticator=AUTHENTICATOR,
         )
     )
 
@@ -55,9 +57,7 @@ def answer(text: str) -> Completion:
 
 
 def create(client: TestClient) -> str:
-    response = client.post(
-        "/tasks", json={"goal": "Settle invoice INV-1", "requested_by": "analyst-1"}
-    )
+    response = client.post("/tasks", json={"goal": "Settle invoice INV-1"})
     assert response.status_code == 201
     task_id: str = response.json()["id"]
     return task_id

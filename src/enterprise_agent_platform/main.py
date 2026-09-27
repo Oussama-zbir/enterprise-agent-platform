@@ -18,6 +18,8 @@ from pydantic import BaseModel
 
 from enterprise_agent_platform import __version__
 from enterprise_agent_platform.agent.runner import AgentRunner
+from enterprise_agent_platform.auth.models import ApprovalPolicy
+from enterprise_agent_platform.auth.tokens import TokenAuthenticator
 from enterprise_agent_platform.config import Settings, get_settings
 from enterprise_agent_platform.demo.tools import build_demo_tools
 from enterprise_agent_platform.llm.client import LLMClient
@@ -60,12 +62,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.mcp_connections = await connect_mcp_servers(
         settings.mcp_servers, app.state.tool_registry
     )
+    authenticator: TokenAuthenticator = app.state.authenticator
+    if not authenticator.is_configured:
+        # Not a failure: an unconfigured deployment authenticates nobody, so the
+        # API is closed rather than open. It is a warning because "every call is
+        # a 401" is otherwise an expensive thing to diagnose from the outside.
+        logger.warning("auth.no_credentials_configured")
     logger.info(
         "service.startup",
         extra={
             "environment": settings.environment,
             "task_store": settings.task_store,
             "tool_count": len(app.state.tool_registry.names),
+            "api_client_count": len(authenticator.subjects),
         },
     )
     try:
@@ -92,6 +101,8 @@ def create_app(
     task_repository: TaskRepository | None = None,
     llm_client: LLMClient | None = None,
     tool_registry: ToolRegistry | None = None,
+    authenticator: TokenAuthenticator | None = None,
+    approval_policy: ApprovalPolicy | None = None,
 ) -> FastAPI:
     """Build and configure a FastAPI application instance.
 
@@ -104,6 +115,12 @@ def create_app(
     run end to end out of the box, and the tools published by the servers in
     ``EAP_MCP_SERVERS`` are added to the registry during startup, once an event
     loop exists to connect them over.
+
+    The authenticator and the approval policy are injectable for the same
+    reason and default to ``EAP_API_CLIENTS`` and
+    ``EAP_APPROVAL_REQUIRES_SECOND_PERSON``. With no credentials configured the
+    task API authenticates nobody and answers 401; ``/health`` stays open so a
+    load balancer does not need one.
     """
     settings = get_settings()
     app = FastAPI(
@@ -117,6 +134,14 @@ def create_app(
     app.state.llm_client = llm_client if llm_client is not None else build_llm_client(settings)
     app.state.tool_registry = (
         tool_registry if tool_registry is not None else ToolRegistry(_configured_tools(settings))
+    )
+    app.state.authenticator = (
+        authenticator if authenticator is not None else TokenAuthenticator(settings.api_clients)
+    )
+    app.state.approval_policy = (
+        approval_policy
+        if approval_policy is not None
+        else ApprovalPolicy(requires_second_person=settings.approval_requires_second_person)
     )
     app.state.mcp_connections = MCPConnections()
     app.state.agent_runner = AgentRunner(

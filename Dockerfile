@@ -9,10 +9,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install dependencies first for better layer caching.
+# Install dependencies first for better layer caching. The postgres extra is
+# included so the image can run the durable task store (see docker-compose.yml);
+# the driver is still an optional extra for anyone installing the package.
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install .
+RUN pip install ".[postgres]"
 
 # Run as a non-root user.
 RUN useradd --create-home --uid 10001 appuser

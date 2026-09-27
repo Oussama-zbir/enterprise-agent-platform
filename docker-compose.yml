@@ -1,0 +1,93 @@
+# The durable path, runnable in one command:
+#
+#   docker compose up
+#
+# API + PostgreSQL + the synthetic demo deployment, so the approval flow can be
+# driven against a real database rather than the in-memory store. Tasks and the
+# checkpoints a paused run resumes from survive `docker compose restart api`.
+#
+# This is a demo deployment, not a production template. The credentials below
+# are published in this repository, the model backend is the scripted stand-in,
+# and the tools move fictional money — which is why `EAP_ENVIRONMENT=production`
+# refuses both `EAP_LLM_PROVIDER=demo` and `EAP_DEMO_TOOLS=true`. A real
+# deployment issues its own tokens, keeps them out of its source tree, and
+# points `EAP_LLM_PROVIDER` at `anthropic` or `bedrock`.
+
+name: enterprise-agent-platform
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: eap
+      POSTGRES_PASSWORD: eap
+      POSTGRES_DB: eap
+    # The API and the schema job wait on this rather than on the container
+    # starting: Postgres accepts connections only after its own init finishes,
+    # so "started" is not "ready".
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eap -d eap"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Published so the repository contract tests can be pointed at it:
+    #   EAP_TEST_DATABASE_URL=postgresql://eap:eap@localhost:5432/eap \
+    #     pytest tests/test_task_repository.py
+    ports:
+      - "5432:5432"
+
+  # DDL as a one-shot job, not as application startup: the service then never
+  # holds schema privileges, and a migration tool can replace this container
+  # without the API changing. Idempotent, so a restart is free.
+  schema:
+    build: .
+    command: ["python", "-m", "enterprise_agent_platform.tasks.postgres"]
+    environment:
+      EAP_DATABASE_URL: postgresql://eap:eap@db:5432/eap
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+      schema:
+        # An API that starts before the table exists fails its first request
+        # instead of its boot, which is the more expensive way to find out.
+        condition: service_completed_successfully
+    environment:
+      EAP_ENVIRONMENT: development
+      EAP_LOG_LEVEL: INFO
+
+      # Durable tasks. An unreachable database fails startup, not the first
+      # request, so `docker compose up` is honest about whether this worked.
+      EAP_TASK_STORE: postgres
+      EAP_DATABASE_URL: postgresql://eap:eap@db:5432/eap
+
+      # The scripted provider and the synthetic accounts-payable tools, so the
+      # whole flow runs with no API key and no network.
+      EAP_LLM_PROVIDER: demo
+      EAP_DEMO_TOOLS: "true"
+      EAP_AGENT_AUTO_APPROVE_UP_TO: read
+
+      # The two credentials this deployment issues. Demo tokens, published on
+      # purpose: the analyst may start work, the manager may release it, and
+      # neither can approve a task they requested themselves.
+      EAP_API_CLIENTS: >-
+        [{"subject":"analyst-1",
+          "token":"demo-analyst-token-please-change-me",
+          "scopes":["tasks:read","tasks:write"]},
+         {"subject":"finance-manager-2",
+          "token":"demo-manager-token-please-change-me",
+          "scopes":["tasks:read","tasks:approve"]}]
+      EAP_APPROVAL_REQUIRES_SECOND_PERSON: "true"
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:

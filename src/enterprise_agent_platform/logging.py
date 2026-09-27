@@ -13,22 +13,29 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+from enterprise_agent_platform.auth.context import get_principal
 from enterprise_agent_platform.request_context import get_request_id
 
 _RESERVED = frozenset(logging.LogRecord("", 0, "", 0, "", None, None).__dict__)
 
 
 class RequestContextFilter(logging.Filter):
-    """Attach the current request ID to records emitted during a request.
+    """Attach the request ID and authenticated subject to in-request records.
 
     Runs in the emitting thread/task, where the request context is visible, so
-    the ID is captured even if formatting is later moved to a queue listener.
+    both are captured even if formatting is later moved to a queue listener.
+    Together they answer the two questions an incident opens with: which call
+    was this, and who made it. Only the subject is emitted — never scopes,
+    never the credential.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         request_id = get_request_id()
         if request_id is not None:
             record.request_id = request_id
+        principal = get_principal()
+        if principal is not None:
+            record.principal = principal.subject
         return True
 
 

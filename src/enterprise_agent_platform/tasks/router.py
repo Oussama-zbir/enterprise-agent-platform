@@ -21,6 +21,8 @@ from enterprise_agent_platform.agent.runner import (
     NotResumableError,
     PendingToolCall,
 )
+from enterprise_agent_platform.auth.dependencies import ApprovalPolicyDep, requires
+from enterprise_agent_platform.auth.models import Principal, Scope
 from enterprise_agent_platform.request_context import get_request_id
 from enterprise_agent_platform.tasks.models import (
     AgentTask,
@@ -45,7 +47,6 @@ class CreateTaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     goal: str = Field(min_length=1, max_length=4000)
-    requested_by: str = Field(min_length=1, max_length=256)
 
 
 class CancelTaskRequest(BaseModel):
@@ -55,24 +56,23 @@ class CancelTaskRequest(BaseModel):
 
 
 class ApproveTaskRequest(BaseModel):
-    """Who is authorising the held tool calls, and optionally why.
+    """Why the held tool calls are being released, optionally.
 
-    ``approved_by`` is required: an approval with no one attached to it is not
-    an audit trail. Like ``requested_by`` it is unverified until the platform has
-    authentication, which is why it is recorded rather than trusted — and never
-    put in front of the model.
+    Who is releasing them is not a field. An approval an unauthenticated caller
+    can sign with any name is not an audit trail, so the approver is the
+    authenticated subject and the body cannot contradict it — ``extra="forbid"``
+    turns an attempt to send ``approved_by`` into a 422 rather than into a
+    silently ignored claim.
     """
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    approved_by: str = Field(min_length=1, max_length=256)
     note: str | None = Field(default=None, max_length=1000)
 
 
 class RejectTaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    rejected_by: str = Field(min_length=1, max_length=256)
     reason: str | None = Field(default=None, max_length=1000)
 
 
@@ -189,10 +189,29 @@ def get_agent_runner(request: Request) -> AgentRunner:
 RepositoryDep = Annotated[TaskRepository, Depends(get_task_repository)]
 RunnerDep = Annotated[AgentRunner, Depends(get_agent_runner)]
 
+# Identity comes from the credential, never from the body. Every route below is
+# closed: reading a task exposes the goal, the model's reasoning about it and
+# the arguments of the tools it wanted to run, which is not less sensitive than
+# starting one.
+ReaderDep = Annotated[Principal, Depends(requires(Scope.TASKS_READ))]
+WriterDep = Annotated[Principal, Depends(requires(Scope.TASKS_WRITE))]
+ApproverDep = Annotated[Principal, Depends(requires(Scope.TASKS_APPROVE))]
+# Seeing a decision is not making it, so either scope opens the approval view.
+ApprovalViewerDep = Annotated[Principal, Depends(requires(Scope.TASKS_READ, Scope.TASKS_APPROVE))]
+
 
 @router.post("", status_code=HTTPStatus.CREATED)
-async def create_task(body: CreateTaskRequest, repository: RepositoryDep) -> TaskResponse:
-    task = AgentTask.create(goal=body.goal, requested_by=body.requested_by)
+async def create_task(
+    body: CreateTaskRequest, repository: RepositoryDep, principal: WriterDep
+) -> TaskResponse:
+    """Record a task on behalf of the authenticated caller.
+
+    ``requested_by`` is taken from the credential rather than the body: it is
+    half of the separation-of-duties check at the approval gate, so a caller
+    that could name themselves could name someone else and approve their own
+    task in two calls.
+    """
+    task = AgentTask.create(goal=body.goal, requested_by=principal.subject)
     await repository.add(task)
     logger.info("task.created", extra={"task_id": str(task.id)})
     return TaskResponse.from_domain(task)
@@ -201,6 +220,7 @@ async def create_task(body: CreateTaskRequest, repository: RepositoryDep) -> Tas
 @router.get("")
 async def list_tasks(
     repository: RepositoryDep,
+    principal: ReaderDep,
     status: TaskStatus | None = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> list[TaskResponse]:
@@ -209,7 +229,7 @@ async def list_tasks(
 
 
 @router.get("/{task_id}")
-async def get_task(task_id: UUID, repository: RepositoryDep) -> TaskResponse:
+async def get_task(task_id: UUID, repository: RepositoryDep, principal: ReaderDep) -> TaskResponse:
     try:
         task = await repository.get(task_id)
     except TaskNotFoundError as exc:
@@ -218,7 +238,7 @@ async def get_task(task_id: UUID, repository: RepositoryDep) -> TaskResponse:
 
 
 @router.post("/{task_id}/run")
-async def run_task(task_id: UUID, runner: RunnerDep) -> RunTaskResponse:
+async def run_task(task_id: UUID, runner: RunnerDep, principal: WriterDep) -> RunTaskResponse:
     """Execute a pending task with the agent loop.
 
     The caller waits for the run to finish. That is honest for the current
@@ -240,7 +260,7 @@ async def run_task(task_id: UUID, runner: RunnerDep) -> RunTaskResponse:
 
 @router.get("/{task_id}/approval")
 async def get_approval(
-    task_id: UUID, repository: RepositoryDep, runner: RunnerDep
+    task_id: UUID, repository: RepositoryDep, runner: RunnerDep, principal: ApprovalViewerDep
 ) -> ApprovalResponse:
     """Show what a paused run is waiting to do.
 
@@ -262,7 +282,12 @@ async def get_approval(
 
 @router.post("/{task_id}/approve")
 async def approve_task(
-    task_id: UUID, body: ApproveTaskRequest, runner: RunnerDep
+    task_id: UUID,
+    runner: RunnerDep,
+    repository: RepositoryDep,
+    policy: ApprovalPolicyDep,
+    principal: ApproverDep,
+    body: ApproveTaskRequest | None = None,
 ) -> RunTaskResponse:
     """Authorise the held tool calls and continue the run.
 
@@ -270,9 +295,31 @@ async def approve_task(
     durable the moment the task transitions, so the run resumed here is the one
     the approver authorised — a second approver racing this one gets 409 rather
     than a second agent replaying the same critical calls.
+
+    Holding `tasks:approve` is not sufficient: by default the approver must be
+    someone other than the subject that requested the task. The check reads the
+    task first, which is safe to do outside the versioned update because
+    `requested_by` is set at creation and no transition ever rewrites it.
     """
     try:
-        result = await runner.resume(task_id, approved_by=body.approved_by, note=body.note)
+        task = await repository.get(task_id)
+    except TaskNotFoundError as exc:
+        raise HTTPException(HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
+
+    if not policy.may_approve(principal, requested_by=task.requested_by):
+        logger.warning(
+            "task.approval.refused",
+            extra={"task_id": str(task_id), "reason": "requester_is_approver"},
+        )
+        raise HTTPException(
+            HTTPStatus.FORBIDDEN,
+            detail="A task must be approved by someone other than the subject that requested it.",
+        )
+
+    try:
+        result = await runner.resume(
+            task_id, approved_by=principal.subject, note=body.note if body else None
+        )
     except TaskNotFoundError as exc:
         raise HTTPException(HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
     except (InvalidTransitionError, ConcurrentUpdateError, NotResumableError) as exc:
@@ -282,10 +329,22 @@ async def approve_task(
 
 
 @router.post("/{task_id}/reject")
-async def reject_task(task_id: UUID, body: RejectTaskRequest, runner: RunnerDep) -> TaskResponse:
-    """Deny the held tool calls; the task is cancelled, not retried."""
+async def reject_task(
+    task_id: UUID,
+    runner: RunnerDep,
+    principal: ApproverDep,
+    body: RejectTaskRequest | None = None,
+) -> TaskResponse:
+    """Deny the held tool calls; the task is cancelled, not retried.
+
+    No separation-of-duties check: withholding a capability needs no second
+    opinion, and requiring one would leave a requester who spotted their own
+    mistake unable to stop the agent acting on it.
+    """
     try:
-        task = await runner.reject(task_id, rejected_by=body.rejected_by, reason=body.reason)
+        task = await runner.reject(
+            task_id, rejected_by=principal.subject, reason=body.reason if body else None
+        )
     except TaskNotFoundError as exc:
         raise HTTPException(HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
     except (InvalidTransitionError, ConcurrentUpdateError) as exc:
@@ -297,14 +356,25 @@ async def reject_task(task_id: UUID, body: RejectTaskRequest, runner: RunnerDep)
 async def cancel_task(
     task_id: UUID,
     repository: RepositoryDep,
+    principal: WriterDep,
     body: CancelTaskRequest | None = None,
 ) -> TaskResponse:
+    """Stop a task, recording who stopped it.
+
+    Like approval and rejection, the actor comes from the credential: a history
+    that names who asked and who approved but not who cancelled leaves the one
+    transition anyone disputes unattributed. No separation-of-duties check —
+    cancelling is withholding, and a requester must be able to stop their own
+    task.
+    """
     try:
+        detail = f"cancelled by {principal.subject}"
+        reason = body.reason if body else None
         task = await transition_task(
             repository,
             task_id,
             TaskStatus.CANCELLED,
-            reason=body.reason if body else None,
+            reason=f"{detail}: {reason}" if reason else detail,
         )
     except TaskNotFoundError as exc:
         raise HTTPException(HTTPStatus.NOT_FOUND, detail=str(exc)) from exc

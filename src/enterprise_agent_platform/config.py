@@ -12,6 +12,7 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from enterprise_agent_platform.auth.models import APIClient
 from enterprise_agent_platform.mcp.policy import MCPServerConfig
 from enterprise_agent_platform.tools.models import RiskLevel
 
@@ -92,6 +93,22 @@ class Settings(BaseSettings):
         ),
     )
 
+    api_clients: tuple[APIClient, ...] = Field(
+        default=(),
+        description=(
+            "Credentials this deployment issues, as a JSON list of {subject, token, scopes}. "
+            "Empty means nothing can authenticate and every /tasks call is a 401 — the API "
+            "is closed by default rather than open by default."
+        ),
+    )
+    approval_requires_second_person: bool = Field(
+        default=True,
+        description=(
+            "Refuse an approval from the subject that requested the task. Turning this off "
+            "keeps the approval gate but removes separation of duties from it."
+        ),
+    )
+
     task_store: TaskStoreName = Field(
         default="memory",
         description="Task persistence backend. 'memory' is per-process and lost on restart.",
@@ -143,6 +160,28 @@ class Settings(BaseSettings):
         """
         if self.environment == "production" and self.task_store == "memory":
             raise ValueError("EAP_TASK_STORE=memory is not usable in production")
+        return self
+
+    @model_validator(mode="after")
+    def _api_client_subjects_are_unique(self) -> Settings:
+        """Subjects identify the actor in the audit trail, so they must be one actor."""
+        subjects = [client.subject for client in self.api_clients]
+        if len(set(subjects)) != len(subjects):
+            raise ValueError("EAP_API_CLIENTS entries must have unique subjects")
+        return self
+
+    @model_validator(mode="after")
+    def _require_credentials_in_production(self) -> Settings:
+        """A production deployment that can authenticate nobody is misconfigured.
+
+        Elsewhere no credentials is a legitimate state — it is what closed by
+        default means, and it is how the test suite proves every route refuses an
+        anonymous caller. In production it means every request is a 401, which is
+        safe but useless, and it is cheaper to learn that at boot than from a
+        pager.
+        """
+        if self.environment == "production" and not self.api_clients:
+            raise ValueError("EAP_API_CLIENTS is required in production")
         return self
 
     @model_validator(mode="after")

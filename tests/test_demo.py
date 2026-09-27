@@ -18,7 +18,9 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from enterprise_agent_platform.agent.runner import AgentRunner
+from enterprise_agent_platform.auth.models import Scope
 from enterprise_agent_platform.config import Settings
+from enterprise_agent_platform.demo.credentials import DEMO_ANALYST, DEMO_MANAGER
 from enterprise_agent_platform.demo.data import AS_OF, Ledger, LedgerError
 from enterprise_agent_platform.demo.provider import (
     DEFAULT_INVOICE_ID,
@@ -29,6 +31,7 @@ from enterprise_agent_platform.demo.provider import (
 from enterprise_agent_platform.demo.tools import build_demo_tools
 from enterprise_agent_platform.demo.walkthrough import (
     WalkthroughError,
+    _bearer,
     build_demo_app,
     run_walkthrough,
 )
@@ -320,11 +323,29 @@ async def test_the_walkthrough_pauses_on_the_payment_and_finishes_once_approved(
     result = await run_walkthrough(build_demo_app(ledger), ledger, out=io.StringIO())
 
     assert result.paused_on == ("pay_invoice",)
+    # The requester's own attempt to release it was refused, and the payment
+    # still happened exactly once: the gate held and the approval worked.
+    assert result.requester_approval_status == 403
     assert result.final_status == "completed"
     # Three model calls: read the invoice, ask to pay it, answer. The pause costs
     # one of them, so a resumed run reporting two would mean the budget reset.
     assert (result.steps, result.tool_calls) == (3, 2)
     assert ledger.payments[DEFAULT_INVOICE_ID].amount_eur == Decimal("1284.50")
+
+
+def test_the_demo_deployment_still_requires_a_credential() -> None:
+    """The demo makes the platform easy to run, not open to anyone who finds it."""
+    client = TestClient(build_demo_app(Ledger()))
+
+    assert client.get("/tasks").status_code == 401
+    assert client.get("/tasks", headers=_bearer(DEMO_ANALYST)).status_code == 200
+
+
+def test_the_demo_credentials_carry_different_authority() -> None:
+    # Two subjects, because the approval gate needs someone who did not ask.
+    assert DEMO_ANALYST.scopes == {Scope.TASKS_READ, Scope.TASKS_WRITE}
+    assert DEMO_MANAGER.scopes == {Scope.TASKS_READ, Scope.TASKS_APPROVE}
+    assert DEMO_ANALYST.subject != DEMO_MANAGER.subject
 
 
 async def test_the_walkthrough_fails_loudly_if_the_gate_stops_gating() -> None:

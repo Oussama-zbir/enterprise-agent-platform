@@ -83,3 +83,64 @@ jobs:
         env:
           EAP_TEST_DATABASE_URL: postgresql://eap:eap@localhost:5432/eap_test
         run: pytest -v tests/test_task_repository.py
+
+  # The compose deployment is the only place the API, the PostgreSQL adapter and
+  # authentication run together in one process tree over a real network, so it is
+  # checked by starting it rather than by linting the file.
+  compose:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate the compose file
+        run: docker compose config -q
+
+      - name: Start the stack
+        # --wait blocks on the API's healthcheck and on the schema job exiting 0,
+        # so a failure here means the durable path did not come up.
+        run: docker compose up -d --wait
+
+      - name: Drive the approval flow against PostgreSQL
+        env:
+          ANALYST: demo-analyst-token-please-change-me
+          MANAGER: demo-manager-token-please-change-me
+        run: |
+          set -euo pipefail
+          api() {
+            local method=$1 path=$2 token=$3
+            curl -sS -o /tmp/body -w '%{http_code}' -X "$method" \
+              -H "Authorization: Bearer $token" "http://localhost:8000$path"
+          }
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:8000/health)" = 200
+
+          # Anonymous callers get nowhere.
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:8000/tasks)" = 401
+
+          id=$(curl -sS -X POST http://localhost:8000/tasks \
+            -H "Authorization: Bearer $ANALYST" -H 'Content-Type: application/json' \
+            -d '{"goal": "Settle invoice INV-1043 with the supplier, in full."}' | jq -r .id)
+          test "$(api POST "/tasks/$id/run" "$ANALYST")" = 200
+          test "$(jq -r .task.status /tmp/body)" = awaiting_approval
+
+          # The analyst holds tasks:write, not tasks:approve.
+          test "$(api POST "/tasks/$id/approve" "$ANALYST")" = 403
+
+          test "$(api POST "/tasks/$id/approve" "$MANAGER")" = 200
+          test "$(jq -r .task.status /tmp/body)" = completed
+          jq -e '.task.history[2].reason == "approved by finance-manager-2"' /tmp/body
+
+          # The task outlives the process that ran it, which is the point of the
+          # durable store.
+          docker compose restart api
+          docker compose up -d --wait api
+          test "$(api GET "/tasks/$id" "$ANALYST")" = 200
+          test "$(jq -r .status /tmp/body)" = completed
+
+      - name: Service logs
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v

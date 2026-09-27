@@ -13,15 +13,18 @@ from enterprise_agent_platform.tasks.repository import (
     ConcurrentUpdateError,
     InMemoryTaskRepository,
 )
+from tests.credentials import ANALYST, AUTHENTICATOR, authorized
 
 
 @pytest.fixture
 def client() -> TestClient:
-    return TestClient(create_app(task_repository=InMemoryTaskRepository()))
+    return authorized(
+        create_app(task_repository=InMemoryTaskRepository(), authenticator=AUTHENTICATOR)
+    )
 
 
 def create(client: TestClient, goal: str = "Reconcile supplier payments") -> dict[str, object]:
-    response = client.post("/tasks", json={"goal": goal, "requested_by": "analyst-1"})
+    response = client.post("/tasks", json={"goal": goal})
     assert response.status_code == 201
     body: dict[str, object] = response.json()
     return body
@@ -39,9 +42,11 @@ def test_create_task_returns_pending_task(client: TestClient) -> None:
 @pytest.mark.parametrize(
     "payload",
     [
-        {"goal": "   ", "requested_by": "u"},
-        {"goal": "x"},
-        {"goal": "x", "requested_by": "u", "status": "completed"},
+        {"goal": "   "},
+        {},
+        {"goal": "x", "status": "completed"},
+        # Identity comes from the credential; a body cannot name the requester.
+        {"goal": "x", "requested_by": "someone-else"},
     ],
 )
 def test_create_task_rejects_invalid_payload(client: TestClient, payload: dict[str, str]) -> None:
@@ -78,13 +83,19 @@ def test_cancel_records_reason_and_is_terminal(client: TestClient) -> None:
     assert body["status"] == "cancelled"
     assert body["is_terminal"] is True
     assert body["version"] == 2
-    assert body["history"][0]["reason"] == "duplicate request"
+    # The canceller is the authenticated subject, as with approval and rejection:
+    # a history that names who asked and who approved but not who cancelled
+    # leaves the one transition anyone disputes unattributed.
+    assert body["history"][0]["reason"] == f"cancelled by {ANALYST.subject}: duplicate request"
 
 
 def test_cancel_without_body_is_accepted(client: TestClient) -> None:
     created = create(client)
 
-    assert client.post(f"/tasks/{created['id']}/cancel").status_code == 200
+    response = client.post(f"/tasks/{created['id']}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["history"][0]["reason"] == f"cancelled by {ANALYST.subject}"
 
 
 def test_cancelling_terminal_task_is_conflict(client: TestClient) -> None:
@@ -109,7 +120,9 @@ class _RacingRepository(InMemoryTaskRepository):
 
 
 def test_concurrent_modification_is_conflict() -> None:
-    client = TestClient(create_app(task_repository=_RacingRepository()))
+    client = authorized(
+        create_app(task_repository=_RacingRepository(), authenticator=AUTHENTICATOR)
+    )
     created = create(client)
 
     response = client.post(f"/tasks/{created['id']}/cancel")

@@ -16,11 +16,12 @@ from fastapi.testclient import TestClient
 
 from enterprise_agent_platform.main import create_app
 from enterprise_agent_platform.request_context import REQUEST_ID_HEADER, get_request_id
+from tests.credentials import ANALYST, AUTHENTICATOR, authorized
 
 
 @pytest.fixture
 def app() -> FastAPI:
-    app = create_app()
+    app = create_app(authenticator=AUTHENTICATOR)
 
     async def probe() -> dict[str, str | None]:
         await asyncio.sleep(0.01)  # yield so concurrent requests interleave
@@ -72,7 +73,7 @@ def test_malformed_inbound_request_id_is_replaced(app: FastAPI, candidate: str) 
 
 
 def test_request_id_is_set_on_error_responses(app: FastAPI) -> None:
-    response = TestClient(app).get("/tasks/not-a-uuid", headers={REQUEST_ID_HEADER: "req-422"})
+    response = authorized(app).get("/tasks/not-a-uuid", headers={REQUEST_ID_HEADER: "req-422"})
 
     assert response.status_code == 422
     assert response.headers[REQUEST_ID_HEADER] == "req-422"
@@ -97,16 +98,20 @@ async def test_concurrent_requests_keep_their_own_request_id(app: FastAPI) -> No
 def test_logs_emitted_during_request_carry_request_id(
     app: FastAPI, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    with TestClient(app) as client:
+    with authorized(app) as client:
         client.post(
             "/tasks",
-            json={"goal": "Reconcile supplier payments", "requested_by": "analyst-1"},
+            json={"goal": "Reconcile supplier payments"},
             headers={REQUEST_ID_HEADER: "req-abc"},
         )
 
     records = {r["message"]: r for r in json_logs(capsys.readouterr().out)}
 
     assert records["task.created"]["request_id"] == "req-abc"
+    # Which call, and who made it: both sides of the question an incident opens
+    # with, on the same record.
+    assert records["task.created"]["principal"] == ANALYST.subject
+    assert "principal" not in records["service.startup"]
     completed = records["request.completed"]
     assert completed["request_id"] == "req-abc"
     assert (completed["method"], completed["path"], completed["status_code"]) == (

@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import NamedTuple
 from uuid import uuid4
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
@@ -20,6 +21,7 @@ from enterprise_agent_platform.main import create_app
 from enterprise_agent_platform.tasks.repository import InMemoryTaskRepository
 from enterprise_agent_platform.tools.models import RiskLevel, Tool
 from enterprise_agent_platform.tools.registry import ToolRegistry
+from tests.credentials import ANALYST, AUTHENTICATOR, MANAGER, OTHER_MANAGER, authorized
 
 
 class PayArgs(BaseModel):
@@ -45,7 +47,11 @@ def answer(text: str) -> Completion:
 
 
 class Fixture(NamedTuple):
+    app: FastAPI
     client: TestClient
+    """Authenticated as the requester: creates tasks and runs them."""
+    approver: TestClient
+    """A second subject, which the approval gate requires by default."""
     paid: list[str]
 
 
@@ -64,20 +70,17 @@ def build(script: list[Completion]) -> Fixture:
         risk=RiskLevel.CRITICAL,
         handler=pay,
     )
-    client = TestClient(
-        create_app(
-            task_repository=InMemoryTaskRepository(),
-            llm_client=LLMClient(FakeLLMProvider(script), timeout_seconds=5),
-            tool_registry=ToolRegistry([tool]),
-        )
+    app = create_app(
+        task_repository=InMemoryTaskRepository(),
+        llm_client=LLMClient(FakeLLMProvider(script), timeout_seconds=5),
+        tool_registry=ToolRegistry([tool]),
+        authenticator=AUTHENTICATOR,
     )
-    return Fixture(client, paid)
+    return Fixture(app, authorized(app, ANALYST), authorized(app, MANAGER), paid)
 
 
 def create(client: TestClient) -> str:
-    response = client.post(
-        "/tasks", json={"goal": "Settle invoice INV-1", "requested_by": "analyst-1"}
-    )
+    response = client.post("/tasks", json={"goal": "Settle invoice INV-1"})
     assert response.status_code == 201
     task_id: str = response.json()["id"]
     return task_id
@@ -96,7 +99,7 @@ def test_the_approval_view_shows_what_the_agent_wants_to_do() -> None:
     f = build([PAY_CALL])
     task_id = pause(f)
 
-    body = f.client.get(f"/tasks/{task_id}/approval").json()
+    body = f.approver.get(f"/tasks/{task_id}/approval").json()
 
     assert body["goal"] == "Settle invoice INV-1"
     assert body["detail"] == "approval required for: pay_invoice"
@@ -117,9 +120,7 @@ def test_approving_runs_the_held_call_and_finishes_the_task() -> None:
     f = build([PAY_CALL, answer("INV-1 is settled.")])
     task_id = pause(f)
 
-    response = f.client.post(
-        f"/tasks/{task_id}/approve", json={"approved_by": "manager-2", "note": "verified"}
-    )
+    response = f.approver.post(f"/tasks/{task_id}/approve", json={"note": "verified"})
 
     assert response.status_code == 200
     body = response.json()
@@ -134,7 +135,7 @@ def test_approving_runs_the_held_call_and_finishes_the_task() -> None:
 def test_the_approval_is_written_into_the_task_history() -> None:
     f = build([PAY_CALL, answer("done")])
     task_id = pause(f)
-    f.client.post(f"/tasks/{task_id}/approve", json={"approved_by": "manager-2"})
+    f.approver.post(f"/tasks/{task_id}/approve")
 
     history = f.client.get(f"/tasks/{task_id}").json()["history"]
 
@@ -144,32 +145,31 @@ def test_the_approval_is_written_into_the_task_history() -> None:
         "running",
         "completed",
     ]
-    assert history[2]["reason"] == "approved by manager-2"
+    assert history[2]["reason"] == f"approved by {MANAGER.subject}"
 
 
 def test_rejecting_cancels_the_task_and_the_held_call_never_runs() -> None:
     f = build([PAY_CALL, answer("done")])
     task_id = pause(f)
 
-    response = f.client.post(
-        f"/tasks/{task_id}/reject",
-        json={"rejected_by": "manager-2", "reason": "supplier not verified"},
-    )
+    response = f.approver.post(f"/tasks/{task_id}/reject", json={"reason": "supplier not verified"})
 
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "cancelled"
     assert body["is_terminal"] is True
-    assert body["history"][-1]["reason"] == "rejected by manager-2: supplier not verified"
+    assert body["history"][-1]["reason"] == (
+        f"rejected by {MANAGER.subject}: supplier not verified"
+    )
     assert f.paid == []
 
 
 def test_a_rejected_task_cannot_then_be_approved() -> None:
     f = build([PAY_CALL, answer("done")])
     task_id = pause(f)
-    f.client.post(f"/tasks/{task_id}/reject", json={"rejected_by": "manager-2"})
+    f.approver.post(f"/tasks/{task_id}/reject")
 
-    response = f.client.post(f"/tasks/{task_id}/approve", json={"approved_by": "manager-3"})
+    response = authorized(f.app, OTHER_MANAGER).post(f"/tasks/{task_id}/approve")
 
     assert response.status_code == 409
     assert f.paid == []
@@ -178,11 +178,11 @@ def test_a_rejected_task_cannot_then_be_approved() -> None:
 def test_a_task_cannot_be_approved_twice() -> None:
     f = build([PAY_CALL, answer("done")])
     task_id = pause(f)
-    assert (
-        f.client.post(f"/tasks/{task_id}/approve", json={"approved_by": "m-2"}).status_code == 200
-    )
+    assert f.approver.post(f"/tasks/{task_id}/approve").status_code == 200
 
-    response = f.client.post(f"/tasks/{task_id}/approve", json={"approved_by": "m-3"})
+    # A different approver, so what refuses the second attempt is the lifecycle
+    # rather than separation of duties.
+    response = authorized(f.app, OTHER_MANAGER).post(f"/tasks/{task_id}/approve")
 
     assert response.status_code == 409
     assert f.paid == ["INV-1"]  # the critical call is not replayed
@@ -192,7 +192,7 @@ def test_approving_a_task_that_never_paused_is_409() -> None:
     f = build([answer("nothing to do")])
     task_id = create(f.client)
 
-    response = f.client.post(f"/tasks/{task_id}/approve", json={"approved_by": "manager-2"})
+    response = f.approver.post(f"/tasks/{task_id}/approve")
 
     assert response.status_code == 409
     assert "cannot transition task from 'pending'" in response.json()["detail"]
@@ -202,7 +202,7 @@ def test_the_approval_view_is_409_when_the_task_is_not_waiting() -> None:
     f = build([answer("nothing to do")])
     task_id = create(f.client)
 
-    response = f.client.get(f"/tasks/{task_id}/approval")
+    response = f.approver.get(f"/tasks/{task_id}/approval")
 
     assert response.status_code == 409
     assert "not awaiting approval" in response.json()["detail"]
@@ -211,26 +211,26 @@ def test_the_approval_view_is_409_when_the_task_is_not_waiting() -> None:
 def test_approving_an_unknown_task_is_404() -> None:
     f = build([answer("done")])
 
-    response = f.client.post(f"/tasks/{uuid4()}/approve", json={"approved_by": "manager-2"})
+    response = f.approver.post(f"/tasks/{uuid4()}/approve")
 
     assert response.status_code == 404
 
 
-def test_an_approval_without_an_approver_is_rejected() -> None:
-    f = build([PAY_CALL])
+def test_the_note_is_optional_and_the_body_may_be_omitted_entirely() -> None:
+    f = build([PAY_CALL, answer("done")])
     task_id = pause(f)
 
-    # An approval with nobody attached to it is not an audit trail.
-    assert f.client.post(f"/tasks/{task_id}/approve", json={}).status_code == 422
-    assert f.client.post(f"/tasks/{task_id}/approve", json={"approved_by": " "}).status_code == 422
-    assert f.paid == []
+    # Who approved is no longer something a body can say, so there is nothing a
+    # body is required to carry; the approver comes from the credential.
+    assert f.approver.post(f"/tasks/{task_id}/approve").status_code == 200
+    assert f.paid == ["INV-1"]
 
 
 def test_the_paused_conversation_is_not_exposed_on_the_task_resource() -> None:
     f = build([PAY_CALL])
     task_id = pause(f)
 
-    body = f.client.get(f"/tasks/{task_id}").json()
+    body = f.approver.get(f"/tasks/{task_id}").json()
 
     # It holds model output and tool results; the approval route serves the one
     # slice anyone needs to act on.
