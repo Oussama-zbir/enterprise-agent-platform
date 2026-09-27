@@ -1,875 +1,255 @@
 # Enterprise Agent Platform
 
+[![CI](https://github.com/Oussama-zbir/enterprise-agent-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/Oussama-zbir/enterprise-agent-platform/actions/workflows/ci.yml)
 [![M8ven Verified](https://m8ven.ai/badge/mcp/oussama-zbir/enterprise-agent-platform?variant=verified)](https://m8ven.ai/mcp/oussama-zbir/enterprise-agent-platform)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](pyproject.toml)
+[![mypy strict](https://img.shields.io/badge/mypy-strict-blue)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-A production-oriented platform for building and operating enterprise AI agents.
+An agent platform built like a production service, not a prototype. An agent
+drives a task through model and tool calls under a step budget; when it reaches a
+tool riskier than the deployment allows unattended, the run **pauses,
+checkpoints itself, and waits for a human** — and the approval that releases it
+is authenticated, recorded, and refused if it comes from the person who asked for
+the work.
 
-> **Status: human-in-the-loop.** This repository is being built incrementally.
-> It has an engineering foundation (config, structured logging with request
-> correlation IDs, strict typing, tests, Docker, CI), a task domain (an explicit
-> agent-task lifecycle, a storage port with optimistic concurrency, and a
-> `/tasks` API), an LLM layer (a provider port with a real Anthropic / Bedrock
-> adapter behind it, including tool calling), a tool layer (typed tools with risk
-> metadata, validated arguments, and bounded execution), the agent runner that
-> drives a task through model and tool calls under a step budget, and a working
-> approval loop: a run that reaches a risky tool pauses, checkpoints itself, and
-> continues from that checkpoint when a human approves it — under bearer-token
-> authentication, so the approver in the audit trail is the authenticated caller
-> rather than a name in a request body. Tools can also come from an external MCP
-> server, adapted into the same typed tool layer and classified for risk locally.
-> `docker compose up` brings up the API against PostgreSQL with the demo
-> deployment loaded. Evaluation and background execution are planned milestones
-> (see [Roadmap](#roadmap)).
-
-## Problem statement
-
-Most agentic AI work stops at a prototype: a prompt, a model call, a response.
-That gap — between a notebook demo and a system an organization can actually
-run — is where the hard engineering lives. This project exists to close it: to
-demonstrate how an agent platform is built with the same rigor as any other
-production service (configuration, observability, testing, reliability,
-security, and deployment), not just clever prompting.
-
-## Architecture (intended)
-
-The foundation is a FastAPI service. Subsequent milestones layer domain and
-agent capabilities on top without disturbing the operational base.
-
-```
-                +--------------------------------------------------+
-                |                 FastAPI service                  |
-                |                                                  |
-  HTTP  ----->  |  auth (bearer token -> Principal, scopes)        |
-                |      |                                           |
-                |      v                                           |
-                |  /tasks router                                   |
-                |      |                                           |
-                |      v                                           |
-                |  task service  -->  TaskRepository (port)        |
-                |      |                  +--> in-memory adapter   |
-                |      |                  +--> PostgreSQL adapter  |
-                |      v                                           |
-                |  AgentTask state machine                         |
-                |      ^                                           |
-                |      +-- AgentRunner (model <-> tool loop)       |
-                |            +--> LLMClient --> provider port      |
-                |            +--> ToolRegistry (typed tools)       |
-                |            +--> MCP client --> transport port    |
-                |            +--> approval + checkpoint/resume     |
-                |                                                  |
-                |  cross-cutting: config · JSON logging ·          |
-                |  X-Request-ID + principal correlation ·          |
-                |  tracing (later)                                 |
-                +--------------------------------------------------+
-```
-
-Current modules:
-
-| Module                                 | Responsibility                                  |
-| -------------------------------------- | ----------------------------------------------- |
-| `enterprise_agent_platform.config`     | Environment-based settings (Pydantic Settings)  |
-| `enterprise_agent_platform.logging`    | Structured JSON logging to stdout               |
-| `...request_context`                   | `X-Request-ID` middleware, request access logs  |
-| `enterprise_agent_platform.main`       | App factory, lifespan, `/health`, router wiring |
-| `...auth.models`                       | `Principal`, `APIClient`, scopes, approval policy |
-| `...auth.tokens`                       | Bearer tokens resolved by digest to a principal |
-| `...auth.dependencies`                 | Route dependencies: 401 vs 403, scope checks    |
-| `...auth.context`                      | The request's principal, for logs               |
-| `...tasks.models`                      | `AgentTask`, lifecycle state machine, checkpoint |
-| `...tasks.repository`                  | `TaskRepository` port + in-memory adapter       |
-| `...tasks.service`                     | Load → transition → persist use case            |
-| `...tasks.router`                      | `/tasks` HTTP routes and API schemas            |
-| `...llm.models`                        | Provider-neutral request/completion types       |
-| `...llm.errors`                        | LLM failure taxonomy with `retryable` flag      |
-| `...llm.provider`                      | `LLMProvider` port + scripted fake provider     |
-| `...llm.client`                        | Timeouts, structured output, LLM call logs      |
-| `...llm.anthropic_provider`            | Anthropic / Bedrock adapter for the port        |
-| `...llm.factory`                       | Backend selection from settings                 |
-| `...tools.models`                      | Typed tool definitions and risk levels          |
-| `...tools.registry`                    | Tool lookup, validation, bounded execution      |
-| `...agent.runner`                      | The run loop: model calls, tools, budgets, approval |
-| `...mcp.protocol`                      | MCP wire types and failure taxonomy             |
-| `...mcp.transport`                     | `MCPTransport` port + stdio subprocess adapter  |
-| `...mcp.client`                        | Handshake, tool discovery, `tools/call`         |
-| `...mcp.policy`                        | Server config and locally owned risk mapping    |
-| `...mcp.tools`                         | Remote tools adapted into the tool registry     |
-| `...mcp.factory`                       | Connect configured servers, register their tools |
-
-### Task lifecycle
-
-```
-pending ──> running ──> completed
-   │           │  ├───> failed
-   │           │  └───> awaiting_approval ──> running   (approved)
-   │           │               │
-   └───────────┴───────────────┴──> cancelled           (cancel / rejected)
-```
-
-`completed`, `failed`, and `cancelled` are terminal. The allowed transitions
-live in one table (`ALLOWED_TRANSITIONS`), so the API, the future orchestrator,
-and the approval workflow cannot disagree about what is legal.
-
-## Design decisions
-
-- **Application factory (`create_app`)** rather than a single global app, so
-  tests and future deployments can build isolated instances with overridden
-  configuration.
-- **Environment-based config with an `EAP_` prefix** via Pydantic Settings —
-  twelve-factor style, validated at load time, no config scattered in code.
-- **Structured JSON logging, dependency-free** — parseable in containers and
-  cloud log aggregators today; a full OpenTelemetry tracing stack is deferred
-  to the observability milestone rather than added prematurely.
-- **Request correlation IDs via a `ContextVar`.** A pure ASGI middleware assigns
-  each request an ID, returns it as `X-Request-ID`, and a logging filter stamps
-  it on every record emitted while the request runs — including logs from deep
-  in the service layer, without threading the ID through function signatures.
-  Pure ASGI (not `BaseHTTPMiddleware`) keeps the context in the endpoint's task
-  and avoids buffering responses. A caller-supplied ID is reused only if it is a
-  short token of `[A-Za-z0-9._:-]`; anything else is replaced, so the header
-  cannot be used for log injection. Unhandled exceptions are logged with the ID
-  and returned as a JSON 500 that still carries the header.
-- **`src/` layout** to keep the importable package separate from tooling and
-  tests, and to catch packaging mistakes early.
-- **Strict typing and linting from day one** so quality is enforced by CI
-  before the codebase grows.
-- **Explicit state machine over free-form status updates.** Agent tasks will be
-  driven by several actors (orchestrator, human approvers, API clients). A
-  single transition table rejects impossible states such as completing a task
-  that never ran, and each change is appended to an audit history.
-- **Immutable tasks with versioning.** Transitions return a new `AgentTask`
-  with `version + 1` rather than mutating in place, which keeps history
-  append-only and makes stale writes detectable.
-- **Optimistic concurrency in the repository.** `update()` takes the version the
-  caller read and fails with `ConcurrentUpdateError` (HTTP 409) if the task has
-  moved on. This avoids lost updates when, say, an approval and a cancellation
-  race, without holding locks across slow LLM or human steps. The PostgreSQL
-  adapter maps this to `UPDATE ... WHERE id = $1 AND version = $7`, so the check
-  and the write are one statement evaluated under the row lock.
-- **Two repository adapters, one contract test suite.** The in-memory and
-  PostgreSQL adapters run the same tests (`tests/test_task_repository.py`);
-  anything an adapter may differ on is deliberately not in them. The PostgreSQL
-  parameters skip unless `EAP_TEST_DATABASE_URL` is set, so the default suite
-  stays offline, and CI runs them against a real server — including a test where
-  two writes on the same version are issued concurrently, which is the only way
-  to catch a version check implemented as two statements.
-- **`history` and `checkpoint` are `jsonb` columns, not child tables.** Both are
-  only ever read with their task and never queried across tasks, so inlining
-  them keeps a transition to a single statement — the same one that performs the
-  version check. Child tables would buy queries nobody makes in exchange for a
-  multi-statement write whose atomicity then depends on the transaction.
-- **The domain's checkpoint invariant is restated as a table constraint.** Only
-  an `awaiting_approval` task may carry run state; a `CHECK` enforces it in the
-  database, so a future writer that bypasses the model still cannot leave a
-  replayable conversation on a finished task. The status `CHECK` list is
-  generated from the `TaskStatus` enum so the two cannot drift.
-- **Rows are validated back through the domain model on read.** A task written
-  by an older build, or edited by hand, has to satisfy the state machine's
-  invariants before anything acts on it.
-- **Schema creation is not application startup.** `apply_schema` is idempotent
-  DDL for local development and tests (`python -m
-  enterprise_agent_platform.tasks.postgres`); the service itself never holds DDL
-  privileges, and a real deployment substitutes a migration tool.
-- **The store is deployment configuration, not application logic.**
-  `EAP_TASK_STORE` selects the adapter, `memory` is rejected in production
-  (a restart would strand an approval that has already been made), and
-  `postgres` without a URL fails at startup rather than on the first write. The
-  driver import is deferred, so asyncpg stays an optional dependency.
-- **Repository as a `Protocol` port, in-memory adapter first.** Persistence
-  technology is deferred until orchestration shows the real access patterns;
-  the adapter is injected through `create_app(task_repository=...)`.
-- **API schemas separate from the domain model**, so the public contract and
-  internal representation can evolve independently. Clients can create, read,
-  list, and cancel tasks; running/approval transitions are reserved for the
-  orchestrator and approval workflow rather than exposed as raw status writes.
-- **LLM access behind a provider port.** Agent code depends on `LLMClient` and
-  provider-neutral types, never on a vendor SDK, so the Anthropic API, Bedrock,
-  and a deterministic fake are interchangeable. Adapters translate vendor
-  exceptions into one taxonomy (`LLMTimeoutError`, `LLMRateLimitError`,
-  `LLMUnavailableError`, `LLMRequestError`, `LLMRefusalError`,
-  `StructuredOutputError`) with a `retryable` flag; whether to retry stays with
-  the caller, which knows the task and its budget.
-- **Structured outputs are validated, not trusted.** `complete_structured`
-  sends the Pydantic model's JSON Schema so providers with native constrained
-  decoding can enforce it, then validates the response regardless. Truncation
-  (`max_tokens`) and refusals are reported as such instead of surfacing as
-  confusing JSON parse errors.
-- **The vendor SDK stops at the adapter.** `AnthropicProvider` is the only
-  module that imports `anthropic`. It maps HTTP status codes to the taxonomy
-  (408 → timeout, 429 → rate limit with the `retry-after` delay, 5xx →
-  unavailable, other 4xx → request error), translates stop reasons, and rejects
-  ones it cannot honour yet (`tool_use`) rather than silently mislabelling them
-  as a normal end of turn. Error messages carry the status code but never the
-  provider's error body, which can echo the prompt.
-- **Provider SDK retries are disabled (`max_retries=0`).** The SDK would happily
-  retry a 429 or 5xx inside a single `complete()` call, which both takes the
-  retry decision away from the caller — the only party that knows the task, its
-  deadline, and its budget — and inflates the latency recorded for what the logs
-  present as one model call.
-- **Schema dialects are adapted, not standardised.** The Messages API only
-  enforces a JSON Schema when its objects are closed; Pydantic emits open ones.
-  The adapter closes them on the way out, so the shared port stays free of one
-  vendor's rules.
-- **Misconfiguration fails at startup.** The default backend (`fake`) is offline
-  only and is rejected when `EAP_ENVIRONMENT=production`, so a deployment that
-  forgot to configure a model dies immediately instead of on the first customer
-  request.
-- **One log record per model call, without content.** `llm.call.completed` /
-  `llm.call.failed` carry provider, model, operation, token usage, stop reason,
-  latency, and the request ID, which is the raw material for cost and latency
-  accounting. Prompt and response text are not logged, only their sizes,
-  because they may contain customer data.
-- **Tools are typed, and their arguments are validated twice.** A tool declares
-  its arguments as a Pydantic model; that model generates the JSON Schema the
-  model sees (sent with `strict: true`, so the provider constrains decoding) and
-  validates what comes back. Handlers therefore receive a typed object, never a
-  raw dictionary produced by a language model.
-- **A model's mistakes are data; a programmer's are exceptions.** An unknown
-  tool name, invalid arguments, a handler that fails or hangs — each returns a
-  `ToolResult` with `is_error`, which the orchestrator feeds back so the model
-  can correct itself. Aborting the task would throw away a run that is usually
-  still recoverable. Registering two tools under one name still raises.
-- **What returns to the model is bounded and scrubbed.** Handler exception
-  messages are logged but never returned — they can carry connection strings or
-  internal identifiers, and everything returned here re-enters the prompt, which
-  is also a prompt-injection surface. Results are truncated so one chatty tool
-  cannot consume the context window. Validation errors *are* returned: the model
-  wrote those arguments, and naming the bad field is what lets it retry.
-- **Risk is metadata on the tool; approval is policy.** Each tool declares
-  `read`, `write`, or `critical`, and `requires_approval` compares that against
-  a deployment-wide threshold. A stricter deployment lowers one threshold
-  instead of editing every tool, and the approval workflow will read the same
-  function the orchestrator does.
-- **Tools are offered per request, not held on the client**, so an orchestrator
-  can narrow the set per task: a model cannot misuse a tool it was never given.
-- **Every run is bounded, and exhausting the budget is a real outcome.** A model
-  that keeps calling tools is a common failure mode that costs money and latency
-  until something stops it. `EAP_AGENT_MAX_STEPS` caps the model calls in one
-  run; hitting the cap fails the task with that reason in its history rather
-  than looping or silently returning a half-finished answer.
-- **Starting a run is a state transition, so a task has at most one agent.**
-  `pending -> running` goes through the repository's version check, so two
-  callers racing to start the same task produce one run and one 409 — not two
-  agents doing the same work with the same tools.
-- **Cancellation is cooperative, and the human wins.** The task is re-read
-  between steps, so a cancelled task stops before the next model call. If the
-  cancellation lands while a step is in flight, the run's final transition is
-  rejected by the lifecycle and its outcome is discarded rather than overwriting
-  the human's decision.
-- **An approval pause stops the whole turn, not the risky call.** When any tool
-  in a turn exceeds `EAP_AGENT_AUTO_APPROVE_UP_TO`, nothing from that turn runs
-  and the task moves to `awaiting_approval`. Executing the rest would mean
-  reconstructing a partially applied turn on approval, and the remaining calls
-  may depend on the paused one.
-- **A pause checkpoints the run, so approval continues it instead of restarting
-  it.** The conversation so far, the steps spent, the tool calls made, and the
-  tokens burned are stored on the task as a `RunCheckpoint`. Restarting on
-  approval would re-ask the model what it has already answered, re-run tools
-  that already ran, and quietly reset the step budget — so a task could be
-  paused and approved its way past `EAP_AGENT_MAX_STEPS` indefinitely.
-- **The checkpoint lives on the task, not in a second store.** Approving,
-  rejecting, and cancelling all decide the same thing — what this task does next
-  — and the version check exists to make exactly one of them win. Splitting run
-  state into its own store would allow a task in `awaiting_approval` with no
-  conversation behind it, a state nothing can act on. Every transition rewrites
-  the checkpoint and clears it by default, so a resumed or finished task cannot
-  carry a stale conversation that a later approval replays.
-- **Resuming re-checks the version the approver read.** `/approve` reads the
-  checkpoint, then transitions; `transition_task` takes the version from that
-  read, so a second approver or a cancellation landing in between produces a 409
-  rather than a second agent replaying the same critical calls.
-- **Rejection ends the task; it is not fed back to the model.** Returning a
-  denial as a recoverable tool error would invite the agent to route around a
-  decision a human just made, which is exactly what an approval gate exists to
-  prevent. The rejection is recorded with who made it, and the checkpoint is
-  dropped so the denied calls cannot be replayed.
-- **Approval is a view, not just a verb.** `GET /tasks/{id}/approval` shows the
-  whole held turn with each call's arguments and risk, and marks which ones
-  tripped the gate — approving a tool by name alone is theatre, and approving
-  one action while its siblings run unexamined is not an informed decision. The
-  view reads the same threshold the pause did, so it cannot disagree with what
-  the run will do. The checkpoint itself is never exposed on `GET /tasks/{id}`:
-  it carries model output and tool results, and this is the only slice of it
-  anyone needs to act on.
-- **Agent failures are outcomes, not exceptions.** A provider error, a refusal,
-  a truncated answer, an exhausted budget — each ends with the task in `failed`
-  and a reason in its history; only genuine lifecycle errors (unknown task, task
-  not startable) propagate as 404/409. The reason returned to the caller is the
-  same string recorded in the audit trail, so the API and the history cannot
-  disagree. Provider error text is not copied into it, since it can echo the
-  prompt.
-- **The prompt carries the goal, not the requester.** `requested_by` is
-  authenticated now, and it still stays out of the prompt: identity in a
-  conversation is an authorization claim the model is in no position to check,
-  and a model that reads who asked can be talked into deferring to it. Authority
-  is decided by scopes and by the approval policy, outside the conversation. The
-  system prompt tells the model that tool results are data, never instructions.
-- **`POST /tasks/{id}/run` is synchronous for now.** The caller waits, which is
-  honest for a single-process deployment. Because progress is recorded on the
-  task rather than in the response, moving execution to a queue and returning
-  202 changes the entrypoint, not the domain logic.
-- **One log record per run** (`agent.run.completed`) with steps, tool calls,
-  token totals, latency, and the originating request ID. The request ID is
-  passed into `AgentRunner.run` explicitly rather than read from a context
-  variable, so a run handed to a background worker still correlates with the
-  request that created the task.
-
-### Authentication: the approval gate has a lock on it
-
-An approval gate that any caller can walk through is not a gate, and an
-`approved_by` field a caller fills in is an audit trail that records whatever it
-was told. Both routes that release held tool calls, and every route that starts
-or reads work, now require a credential.
-
-- **Identity comes from the credential, never from the body.** `requested_by`,
-  `approved_by` and `rejected_by` are no longer request fields; they are the
-  authenticated subject, written into the task's immutable history. The request
-  schemas keep `extra="forbid"`, so a body that tries to name the approver is a
-  422 rather than a silently ignored claim. What is left in a body is the part
-  only a human can supply: the note or the reason. Cancellation records its
-  subject the same way — a history that names who asked and who approved but not
-  who cancelled leaves the one transition anyone disputes unattributed.
-- **Three types, kept apart.** `APIClient` is configuration — a credential a
-  deployment issues, holding a secret that never leaves the process.
-  `Principal` is identity — subject plus scopes, carrying no secret, which is
-  what routes, logs and the audit trail see. `ApprovalPolicy` is authority over
-  a specific decision, which a scope cannot express: holding `tasks:approve`
-  says you may approve tasks, not that you may approve *this* one.
-- **`tasks:write` and `tasks:approve` are different scopes.** The whole point of
-  the gate is that the authority to make an agent act is not the authority to
-  release what it wants to do. A deployment may issue both to one credential —
-  that is a choice, and the history still records which subject acted.
-- **Separation of duties, by default.** A task cannot be approved by the subject
-  that requested it. The requester already decided they wanted the action, so
-  their approval carries no new information: it is a delay, not a review.
-  `EAP_APPROVAL_REQUIRES_SECOND_PERSON=false` turns it off, because a
-  single-operator deployment that switches it off has made a decision, while one
-  that never had the check has an approval gate in name only. Rejection has no
-  such check — withholding a capability needs no second opinion, and requiring
-  one would leave someone who spotted their own mistake unable to stop the agent
-  acting on it.
-- **Only digests are stored, and lookup is by digest.** Tokens are held as
-  SHA-256 digests, so a heap dump or a careless `repr` yields nothing
-  replayable, and a presented token is hashed and looked up rather than compared
-  against a list — the work done is the same whether a token is wrong in its
-  first character or its last. Scanning with `==` would leak a prefix oracle.
-  SHA-256 rather than a password hash on purpose: these are high-entropy machine
-  credentials, so there is no dictionary to slow down, and a deliberately slow
-  KDF on every request is a denial-of-service lever.
-- **401 and 403 are not interchangeable.** 401 with `WWW-Authenticate: Bearer`
-  means *we do not know who you are*, and presenting a credential would change
-  the answer. 403 means *we know who you are and it is not enough*, and no
-  challenge is sent, because inviting a client to re-authenticate against a scope
-  problem produces a retry loop rather than a fix. Authentication runs before
-  request validation, so an anonymous caller learns nothing about the shape of
-  the API from a 422.
-- **Closed by default, and refused in production if closed.** No configured
-  credentials means nothing can authenticate, so an unconfigured deployment
-  authenticates nobody rather than everybody. In production that state is
-  refused at startup: a service that can authenticate nobody is misconfigured
-  rather than safe, and it is cheaper to learn that at boot than from a pager.
-- **The subject lands on every log record of the request**, next to the request
-  ID — which call was this, and who made it, the two halves of the question an
-  incident opens with. Scopes and tokens are never logged: a token in a log file
-  is a credential in a log file, and rejections are logged with a reason instead.
-- **`/health` stays open** so a load balancer does not need a credential, and
-  the read routes are closed with the rest: a task's goal, the model's answer and
-  the arguments of the tools it wanted to run are not less sensitive than
-  starting one.
-- **Static tokens, deliberately.** This is the layer an OIDC or JWT verifier
-  would replace, and replacing it touches one module, because routes depend on
-  `Principal` rather than on how one was obtained. Users, groups, per-task
-  ownership and token rotation are out of scope on purpose — the point is that
-  the gate has a lock, not that this is an IAM system.
-
-### MCP: remote tools under local risk policy
-
-A deployment can source tools from external MCP servers, declared in
-`EAP_MCP_SERVERS`:
-
-```json
-[
-  {
-    "name": "finance",
-    "command": "python",
-    "args": ["-m", "finance_mcp"],
-    "default_risk": "read",
-    "tool_risk": { "pay_invoice": "critical" }
-  }
-]
-```
-
-Each server is started at application startup, handshaken, and asked for its
-tools; every tool becomes an ordinary `Tool` in the ordinary `ToolRegistry`,
-registered as `finance__pay_invoice`. From there the agent runner, the risk
-gate, the approval workflow, the per-call timeout, and result truncation apply
-to it unchanged — no part of the agent imports anything from the `mcp` package,
-and swapping a local tool for a remote one changes no agent code.
-
-The design decisions worth naming:
-
-- **Risk is decided locally, never read from the server.** Tool discovery
-  happens at runtime against code outside this repository, so a server could
-  otherwise add `transfer_funds` to a running agent, or advertise
-  `readOnlyHint: true` on a payment tool. Risk resolves from a per-tool
-  override, then the server's configured default, then `CRITICAL` — so an
-  unmapped tool is gated rather than waved through. The failure mode of this
-  design is an unnecessary approval prompt; it is never an ungated action.
-- **Server metadata cannot reach the decision.** `MCPToolDeclaration` parses
-  with `extra="ignore"`, so annotations, hints and titles are dropped at the
-  parse boundary. The platform has nowhere to put a server's claim about its own
-  safety, which is what makes the policy unbypassable rather than merely
-  unbypassed. This is the posture the runner already takes toward tool *results*
-  (data, not instructions), extended to tool *declarations*.
-- **The model sees the server's schema; the platform validates with its own.**
-  The server's JSON Schema carries per-property descriptions and constraints
-  that make tool calls land, so it is what is offered to the model. A Pydantic
-  model derived from it does the validating, so a remote handler never receives
-  an unvalidated dictionary. The derived model is deliberately a coarsening —
-  required fields and broad types, nothing else — so it can never reject
-  arguments the schema the model was shown would allow.
-- **Server-side tool failures are data; protocol failures are not.** `isError`
-  on a `tools/call` result becomes `ToolResult(is_error=True)` and the model can
-  correct itself. A dead subprocess or a malformed frame raises instead: the
-  model cannot fix it, and the text can name hosts and commands.
-- **The client bounds what a server can impose.** Tools per server, pages of
-  `tools/list`, characters per result, and bytes per JSON-RPC frame are all
-  capped, because each is otherwise a remote party choosing this platform's
-  context window, per-call cost, or memory ceiling.
-- **The child process inherits no environment.** An MCP server is third-party
-  code with a shell on the host; handing it this process's API keys and database
-  URL because it was started from here is an avoidable credential leak. A
-  deployment passes exactly what the server needs.
-- **The transport is a port.** `MCPTransport` is request/notify/close;
-  `StdioTransport` runs a child process and multiplexes replies by JSON-RPC id
-  so parallel tool calls share one pipe. The whole client is therefore testable
-  against an in-process stub, and the suite also runs a real subprocess server
-  — offline, with no MCP server installed.
-
-## Technology stack
-
-- Python 3.12+
-- FastAPI + Uvicorn
-- Anthropic SDK (Messages API, first-party or Bedrock)
-- Pydantic v2 / pydantic-settings
-- PostgreSQL (asyncpg), optional — in-memory store by default
-- pytest + pytest-asyncio
-- Ruff (lint + format), mypy (strict)
-- Docker, GitHub Actions
-
-## Setup
-
-Requires Python 3.12 or newer.
+Tools are typed and risk-classified locally, including tools sourced from
+external **MCP** servers. Tasks, their audit history and the checkpoint a paused
+run resumes from are durable in **PostgreSQL** under optimistic concurrency, so
+two racing approvals cannot both release the same critical call.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+docker compose up                             # API + PostgreSQL, one command
+python -m enterprise_agent_platform.demo      # the whole flow, offline, no API key
+```
+
+---
+
+## What this demonstrates
+
+| | |
+| --- | --- |
+| **Agent orchestration** | A hand-written run loop — model call → tool execution → tool results → model call — bounded by a step budget, with cooperative cancellation and one-runner-per-task enforced by the domain's version check rather than a lock. No agent framework. |
+| **Human-in-the-loop** | Approval **pauses a run and resumes it**: the paused conversation and the counters already spent are checkpointed on the task, so an approved run continues where it stopped instead of re-asking the model and re-running tools. A task cannot be paused and approved past its step budget. |
+| **Authenticated approvals** | Bearer credentials resolved to a secret-free `Principal`; `tasks:write` and `tasks:approve` are separate scopes, and by default a task cannot be approved by the subject that requested it. The actor in the audit trail is the credential's subject — identity is not a request field. |
+| **Local tool-risk governance** | Every tool carries a risk level, and one deployment-wide threshold decides what runs unattended. Risk is assigned **locally**, never read from the tool's own metadata, so a server that self-declares a payment as safe is still gated. |
+| **MCP integration** | Tools published by external MCP servers are adapted into the platform's own typed tool layer, so the run loop, risk gate, approval workflow, timeouts and result truncation apply to them unchanged. The transport is a port; stdio is one adapter. |
+| **Optimistic concurrency** | Immutable versioned tasks with an append-only transition history. In PostgreSQL the check and the write are one statement (`UPDATE … WHERE id = $1 AND version = $7 RETURNING version`), so they happen under the same row lock — the race is decided by the database, not by the application. |
+| **PostgreSQL durability** | An asyncpg adapter behind the repository port: domain invariants restated as table `CHECK` constraints, JSONB for data only ever read with its aggregate, pool lifecycle tied to the app lifespan, and schema management kept out of startup. |
+| **Provider abstraction** | A provider-neutral LLM port with a real Anthropic / Bedrock adapter behind it: the vendor SDK reaches two modules — the adapter that translates its types and the factory that builds its client — and nothing above the port sees an SDK type. Failure taxonomy with a `retryable` flag, hard timeouts, schema-validated structured output, and token/latency logs that never carry prompt content. |
+| **Testing and CI** | 291 tests, no API key and no network. One contract suite both storage adapters must pass, run against a real `postgres:17` container in CI. Ruff, `mypy --strict`, and a CI job that starts the compose stack and drives the approval flow through it. |
+
+## Architecture
+
+```mermaid
+flowchart TB
+    analyst(["analyst<br/>tasks:write"])
+    manager(["manager<br/>tasks:approve"])
+
+    subgraph service["FastAPI service"]
+        auth["auth<br/>bearer token to Principal<br/>subject + scopes"]
+        api["/tasks API<br/>create · run · approval<br/>approve · reject · cancel"]
+        runner["AgentRunner<br/>model and tool loop<br/>step budget · cancellation"]
+        gate{"risk gate<br/>above the unattended<br/>threshold?"}
+        registry["ToolRegistry<br/>typed args · risk level<br/>per-call timeout"]
+        llm["LLMClient<br/>provider-neutral port"]
+        repo["TaskRepository port<br/>version-checked writes"]
+    end
+
+    anthropic["Anthropic / Bedrock<br/>adapter"]
+    mcp["MCP servers<br/>stdio transport<br/>risk assigned locally"]
+    tools["deployment tools<br/>demo: accounts payable"]
+    pg[("PostgreSQL<br/>task · audit history<br/>run checkpoint")]
+    paused["awaiting_approval<br/>checkpoint: held calls,<br/>conversation, spent budget"]
+
+    analyst --> auth
+    manager --> auth
+    auth --> api
+    api --> runner
+    runner --> llm
+    llm --> anthropic
+    runner --> registry
+    tools --> registry
+    mcp --> registry
+    registry --> gate
+    gate -->|"no: run it"| runner
+    gate -->|"yes: hold the turn"| paused
+    paused -->|"GET /approval<br/>arguments + risk"| manager
+    manager -->|"approve: resume<br/>from the checkpoint"| runner
+    runner --> repo
+    api --> repo
+    repo --> pg
+```
+
+Everything in that diagram is implemented. The detailed module map, the task
+state machine, and the reasoning behind each decision are in
+**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
+## Demo — the whole flow, offline
+
+No API key, no network, no database. A scripted provider stands in for the model;
+everything else is the real system:
+
+```bash
 pip install -e ".[dev]"
-cp .env.example .env
-```
-
-The default model backend is `fake`: offline, and every call raises. Point it at
-a real model with environment variables (never commit a key):
-
-```bash
-# Anthropic API — omit the key to use the SDK's own credential resolution
-EAP_LLM_PROVIDER=anthropic EAP_ANTHROPIC_API_KEY=sk-ant-... EAP_LLM_MODEL=claude-opus-5
-
-# Bedrock — credentials come from the standard AWS chain
-EAP_LLM_PROVIDER=bedrock EAP_AWS_REGION=eu-west-1 EAP_LLM_MODEL=anthropic.claude-opus-5
-```
-
-Every `/tasks` route needs a bearer token, and the deployment issues them. With
-none configured, nothing can authenticate and every call is a 401 — closed by
-default rather than open by default:
-
-```bash
-export EAP_API_CLIENTS='[
-  {"subject":"analyst-1","token":"'"$(python -c 'import secrets; print(secrets.token_urlsafe(24))')"'",
-   "scopes":["tasks:read","tasks:write"]},
-  {"subject":"finance-manager-2","token":"'"$(python -c 'import secrets; print(secrets.token_urlsafe(24))')"'",
-   "scopes":["tasks:read","tasks:approve"]}
-]'
-```
-
-The subject is what lands in logs and in the task's audit history. `tasks:write`
-starts work, `tasks:approve` releases what a paused run wants to do, and by
-default a task cannot be approved by the subject that requested it. Tokens are
-at least 32 characters, stored only as digests, and never logged.
-
-Tasks are held in memory by default, which is lost on restart. For a durable
-store, install the extra and point the service at PostgreSQL:
-
-```bash
-pip install -e ".[dev,postgres]"
-
-export EAP_TASK_STORE=postgres
-export EAP_DATABASE_URL=postgresql://eap:eap@localhost:5432/eap
-
-# Create the table and indexes once (stands in for a migration tool)
-python -m enterprise_agent_platform.tasks.postgres
-```
-
-## Demo — run the approval flow, offline
-
-The platform ships no tools of its own, so a deployment declares what its agents
-may do. `src/enterprise_agent_platform/demo/` is one such deployment: synthetic
-accounts-payable data, four tools spanning the risk range (`lookup_invoice` and
-`list_overdue_invoices` are `read`, `add_invoice_note` is `write`, `pay_invoice`
-is `critical`), and a scripted stand-in for a model. No API key, no network, no
-database:
-
-```bash
 python -m enterprise_agent_platform.demo
 ```
 
-It drives the real application over HTTP through an in-process ASGI transport
-and prints every call, so the transcript is the system rather than a
-description of it:
+![Terminal transcript: an agent run pauses on a critical pay_invoice call, the requester's own approval is refused, a second person approves, and the run resumes from its checkpoint](docs/images/demo.svg)
 
-```
-# 0. The two credentials this deployment issues.
-$ export EAP_ANALYST_TOKEN=demo-analyst-token-please-change-me  # analyst-1: tasks:read, tasks:write
-$ export EAP_MANAGER_TOKEN=demo-manager-token-please-change-me  # finance-manager-2: tasks:approve, tasks:read
+<sub>Abbreviated for width: `$API` is `http://127.0.0.1:8000`, `<id>` is the task
+UUID, and `…` marks elided JSON fields. Steps 1 and 6 — create, and the final
+audit history — are printed in full by the command.</sub>
 
-# 2. Run it. The agent reads the invoice unattended, then asks to pay it —
-#    'pay_invoice' is CRITICAL, above EAP_AGENT_AUTO_APPROVE_UP_TO=read,
-#    so the whole turn stops and the task parks in 'awaiting_approval'.
-$ curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/run \
-    -H "Authorization: Bearer $EAP_ANALYST_TOKEN"
-{"message": "tool.call.completed", "tool": "lookup_invoice", "risk": "read", "outcome": "ok", ...}
-{"message": "agent.run.completed", "status": "awaiting_approval", "steps": 2, "tool_calls": 1,
- "input_tokens": 565, "output_tokens": 20, "duration_ms": 1.14, "request_id": "9a998cef-...",
- "principal": "analyst-1"}
-{
-  "task": { "status": "awaiting_approval", "version": 3, ... },
-  "detail": "approval required for: pay_invoice",
-  "steps": 2, "tool_calls": 1, "input_tokens": 565, "output_tokens": 20,
-  "pending_tool_calls": ["pay_invoice"]
-}
-
-# 3. Show the approver the decision: which calls are held, with the
-#    arguments they would run with and the risk that stopped them.
-$ curl -s -X GET http://127.0.0.1:8000/tasks/<uuid>/approval \
-    -H "Authorization: Bearer $EAP_MANAGER_TOKEN"
-{
-  "goal": "Settle invoice INV-1043 with the supplier, in full.",
-  "status": "awaiting_approval", "detail": "approval required for: pay_invoice",
-  "pending_tool_calls": [{"id": "demo_2_0", "name": "pay_invoice",
-    "arguments": {"invoice_id": "INV-1043", "amount_eur": "1284.50"},
-    "risk": "critical", "needs_approval": true}]
-}
-
-# 4. The analyst tries to release the task they asked for. 403: their token
-#    carries 'tasks:write', not 'tasks:approve' — the authority to make an
-#    agent act is not the authority to release what it wants to do. A token
-#    holding both is refused too, by the separation-of-duties check, since
-#    the subject that requested a task cannot be the one that approves it.
-$ curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/approve \
-    -H "Authorization: Bearer $EAP_ANALYST_TOKEN"
-{"message": "auth.rejected", "reason": "insufficient_scope", "principal": "analyst-1",
- "required_scopes": ["tasks:approve"], "request_id": "4e1c0b7a-...", ...}
-{ "detail": "This token holds none of: tasks:approve." }
-
-# 5. The manager approves. The held call runs and the *same* run continues
-#    from its checkpoint: the counters below cover the whole run, pause
-#    included. Who approved comes from the token, not from the body.
-$ curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/approve \
-    -H "Authorization: Bearer $EAP_MANAGER_TOKEN" \
-    -H 'Content-Type: application/json' \
-    -d '{"note": "supplier and amount verified"}'
-{ "task": {"status": "completed", "version": 5,
-    "history": [..., {"to_status": "running",
-      "reason": "approved by finance-manager-2: supplier and amount verified"}, ...]},
-  "detail": "agent run completed",
-  "steps": 3, "tool_calls": 2, "input_tokens": 909, "output_tokens": 109 }
-```
-
-The walkthrough also checks its own story — the run must pause on the critical
-tool, the requester's own attempt to release it must be refused, the approval
-must continue the paused run's step budget rather than reset it, and the ledger
-must end with exactly one payment — so it exits non-zero if
-the platform stops behaving the way the transcript says it does. The same code
-path runs as a test (`tests/test_demo.py`) on every CI build, which is what
-keeps this section from drifting away from the system.
-
-Set `EAP_LOG_LEVEL=WARNING` for a transcript without the interleaved service
-logs, or run the same deployment under uvicorn and curl it yourself:
-
-```bash
-EAP_LLM_PROVIDER=demo EAP_DEMO_TOOLS=true \
-  EAP_API_CLIENTS='[{"subject":"analyst-1","token":"demo-analyst-token-please-change-me","scopes":["tasks:read","tasks:write"]},
-                    {"subject":"finance-manager-2","token":"demo-manager-token-please-change-me","scopes":["tasks:read","tasks:approve"]}]' \
-  uvicorn enterprise_agent_platform.main:app
-```
-
-Those are the same two credentials the transcript prints; they are declared in
-`src/enterprise_agent_platform/demo/credentials.py`, which is also why the demo
-is refused in production.
-
-Or `docker compose up`, which does the same against PostgreSQL — see
-[Docker](#docker). Both demo settings are refused when
-`EAP_ENVIRONMENT=production`: a flag that turns on capabilities is a flag that
-has to be refused somewhere, and the demo's tokens are published in this
-repository.
+The demo drives the real application over HTTP through an in-process ASGI
+transport (same routes, middleware, authentication, runner and risk gate) and
+**asserts its own story**: the run must pause on the critical call, the
+requester's approval must be refused, the approved run must continue the paused
+run's budget rather than reset it, and the ledger must end with exactly one
+payment. It exits non-zero otherwise, and the same code path runs as a test on
+every CI build — so this section cannot quietly stop matching the system.
 
 Two things in that transcript are the demo's, not the platform's. The scripted
-provider is a stand-in for a model — it matches the goal to one of two planned
-scenarios and reads each turn's arguments out of the previous turn's tool
-results, so the run is still driven by what the tools returned, but it is not
+provider is a stand-in for a model: it matches the goal to one of two planned
+scenarios and reads each turn's arguments out of the previous turn's *actual*
+tool results, so the run is still driven by what the tools returned, but it is not
 reasoning. And token counts are estimated from character length rather than
-tokenized. Everything else — the loop, the risk gate, the pause, the
-checkpoint, the resumed budget, the audit history, the logs — is the real
-system. Point `EAP_LLM_PROVIDER` at `anthropic` and the same tools run against
+tokenized. Point `EAP_LLM_PROVIDER` at `anthropic` and the same tools run against
 a real model with nothing else changed.
 
-## Local development
-
-Run the service:
-
-```bash
-uvicorn enterprise_agent_platform.main:app --reload
-```
-
-Then:
-
-```bash
-curl http://127.0.0.1:8000/health
-# {"status":"ok","service":"enterprise-agent-platform","environment":"development","version":"0.1.0"}
-```
-
-`/health` is the only open route. Everything below presents a token from
-`EAP_API_CLIENTS` (see [Setup](#setup)); without one the answer is
-`401` with `WWW-Authenticate: Bearer`, and with a token that lacks the scope the
-route needs it is `403`:
-
-```bash
-export WRITER=<a token whose scopes include tasks:write>
-export APPROVER=<a token whose scopes include tasks:approve>
-```
-
-Create, inspect, and cancel a task. The requester is the token's subject, so
-there is no `requested_by` field to send:
-
-```bash
-curl -s -X POST http://127.0.0.1:8000/tasks \
-  -H "Authorization: Bearer $WRITER" -H 'Content-Type: application/json' \
-  -d '{"goal": "Reconcile supplier payments for March"}'
-# {"id":"<uuid>","requested_by":"analyst-1","status":"pending","version":1,...,"history":[]}
-
-curl -s 'http://127.0.0.1:8000/tasks?status=pending&limit=20' -H "Authorization: Bearer $WRITER"
-curl -s http://127.0.0.1:8000/tasks/<uuid> -H "Authorization: Bearer $WRITER"
-
-curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/cancel \
-  -H "Authorization: Bearer $WRITER" -H 'Content-Type: application/json' \
-  -d '{"reason": "duplicate request"}'
-# 200 with status "cancelled" and history "cancelled by analyst-1: duplicate
-# request"; cancelling again returns 409 Conflict
-```
-
-Run a task with the agent loop:
-
-```bash
-curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/run -H "Authorization: Bearer $WRITER"
-# {"task":{"status":"completed","version":3,"history":[...]},
-#  "output":"...", "detail":"agent run completed",
-#  "steps":3, "tool_calls":2, "input_tokens":909, "output_tokens":109,
-#  "pending_tool_calls":[]}
-```
-
-The run drives the task: `pending -> running -> completed | failed`, or
-`awaiting_approval` when the model asks for a tool riskier than
-`EAP_AGENT_AUTO_APPROVE_UP_TO` (then `pending_tool_calls` names what it wants).
-Running the same task twice returns 409. The platform ships with no tools of its
-own: a deployment registers them through `create_app(tool_registry=...)`, points
-`EAP_MCP_SERVERS` at an MCP server, or sets `EAP_DEMO_TOOLS=true` for the
-synthetic set above.
-
-Approve or reject what a paused run wants to do:
-
-```bash
-curl -s http://127.0.0.1:8000/tasks/<uuid>/approval -H "Authorization: Bearer $APPROVER"
-# {"task_id":"<uuid>","goal":"Settle invoice INV-1","status":"awaiting_approval",
-#  "paused_at":"...","detail":"approval required for: pay_invoice",
-#  "pending_tool_calls":[{"id":"call_1","name":"pay_invoice",
-#    "arguments":{"invoice_id":"INV-1"},"risk":"critical","needs_approval":true}]}
-
-curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/approve \
-  -H "Authorization: Bearer $APPROVER" -H 'Content-Type: application/json' \
-  -d '{"note": "supplier verified"}'
-# the held calls run, the run continues from its checkpoint, and the response is
-# a run outcome whose steps/tokens cover the whole run, pause included.
-# The approver written into the history is this token's subject; an
-# `approved_by` field in the body is a 422, and the subject that requested the
-# task is a 403 unless EAP_APPROVAL_REQUIRES_SECOND_PERSON is off.
-
-curl -s -X POST http://127.0.0.1:8000/tasks/<uuid>/reject \
-  -H "Authorization: Bearer $APPROVER" -H 'Content-Type: application/json' \
-  -d '{"reason": "supplier not verified"}'
-# 200 with status "cancelled"; the held calls never run
-```
-
-| Method & path               | Scope           | Result                                  |
-| --------------------------- | --------------- | --------------------------------------- |
-| `GET /health`               | none            | 200; open, so probes need no credential |
-| `POST /tasks`               | `tasks:write`   | 201 pending task; 422 on invalid or unknown fields |
-| `GET /tasks`                | `tasks:read`    | Newest first; optional `status` filter, `limit` 1–200 |
-| `GET /tasks/{id}`           | `tasks:read`    | 200, or 404 if unknown                  |
-| `POST /tasks/{id}/run`      | `tasks:write`   | 200 with the run outcome; 404 unknown; 409 not pending |
-| `GET /tasks/{id}/approval`  | `read`/`approve`| 200 with the held calls; 404 unknown; 409 if not paused |
-| `POST /tasks/{id}/approve`  | `tasks:approve` | 200 with the resumed run's outcome; 403 if the requester; 404; 409 if not paused |
-| `POST /tasks/{id}/reject`   | `tasks:approve` | 200 cancelled task; 404 unknown; 409 if not paused |
-| `POST /tasks/{id}/cancel`   | `tasks:write`   | 200; 404 unknown; 409 terminal task or concurrent write |
-
-Every closed route answers 401 with `WWW-Authenticate: Bearer` when no
-credential is presented, and 403 with no challenge when the credential holds
-none of the scopes the route accepts.
-
-Every response carries an `X-Request-ID` header (the caller's, if well-formed,
-otherwise a generated UUID), and every log line written during that request
-includes it:
-
-```bash
-curl -s -i http://127.0.0.1:8000/tasks -H 'X-Request-ID: req-42' | grep -i x-request-id
-# x-request-id: req-42
-# log: {"message": "request.completed", "method": "GET", "path": "/tasks",
-#       "status_code": 200, "duration_ms": 0.4, "request_id": "req-42", ...}
-```
-
-Records emitted while handling an authenticated request also carry the subject
-that made it — which call, and who made it:
-
-```bash
-# log: {"message": "task.created", "task_id": "<uuid>", "request_id": "req-42",
-#       "principal": "analyst-1"}
-```
-
-Interactive API docs are available at `http://127.0.0.1:8000/docs`.
-
-## Quality checks
-
-```bash
-ruff check .          # lint
-ruff format --check . # formatting
-mypy                  # static type checking (strict)
-pytest -v             # tests
-```
-
-All four run in CI on Python 3.12 and 3.13. The repository contract tests are
-skipped against PostgreSQL unless a database is named:
-
-```bash
-EAP_TEST_DATABASE_URL=postgresql://eap:eap@localhost:5432/eap_test \
-  pytest -v tests/test_task_repository.py
-```
-
-CI runs them in a second job against a `postgres:17` service container, and a
-third job starts the compose stack and drives the approval flow through it —
-create, run, refused approval, approval, then a restart to prove the task
-survived it.
-
-## Docker
-
-The image alone, with the default in-memory store and no credentials issued —
-useful for checking the build, and it will answer 401 on every `/tasks` call:
-
-```bash
-docker build -t enterprise-agent-platform .
-docker run --rm -p 8000:8000 enterprise-agent-platform
-```
-
-The durable path, in one command:
+## Quick start — the durable path
 
 ```bash
 docker compose up
 ```
 
-That brings up PostgreSQL, applies the schema as a one-shot job, and starts the
-API against it with the demo tools, the scripted provider and two issued
-credentials — so the approval flow can be driven end to end, against a real
-database, with no API key and no network:
+PostgreSQL, then the schema as a one-shot job, then the API waiting on both, with
+the demo tools loaded and two credentials issued:
 
 ```bash
-export EAP_ANALYST_TOKEN=demo-analyst-token-please-change-me
-export EAP_MANAGER_TOKEN=demo-manager-token-please-change-me
+export API=http://localhost:8000
+export ANALYST=demo-analyst-token-please-change-me
+export MANAGER=demo-manager-token-please-change-me
 
-id=$(curl -s -X POST http://localhost:8000/tasks \
-  -H "Authorization: Bearer $EAP_ANALYST_TOKEN" -H 'Content-Type: application/json' \
+id=$(curl -s -X POST $API/tasks -H "Authorization: Bearer $ANALYST" \
+  -H 'Content-Type: application/json' \
   -d '{"goal": "Settle invoice INV-1043 with the supplier, in full."}' | jq -r .id)
 
-curl -s -X POST "http://localhost:8000/tasks/$id/run" \
-  -H "Authorization: Bearer $EAP_ANALYST_TOKEN" | jq .task.status
-# "awaiting_approval"
+curl -s -X POST "$API/tasks/$id/run"     -H "Authorization: Bearer $ANALYST" | jq .task.status
+# "awaiting_approval"    <- the agent asked to pay; the gate held the whole turn
 
-curl -s -X POST "http://localhost:8000/tasks/$id/approve" \
-  -H "Authorization: Bearer $EAP_MANAGER_TOKEN" | jq .task.status
-# "completed"
+curl -s -X POST "$API/tasks/$id/approve" -H "Authorization: Bearer $ANALYST" | jq .detail
+# "This token holds none of: tasks:approve."      <- 403
+
+curl -s -X POST "$API/tasks/$id/approve" -H "Authorization: Bearer $MANAGER" | jq .task.status
+# "completed"            <- the held call ran, on the same run's budget
 
 docker compose restart api && docker compose up -d --wait api
-curl -s "http://localhost:8000/tasks/$id" \
-  -H "Authorization: Bearer $EAP_ANALYST_TOKEN" | jq .status
-# "completed" — the task and its audit history outlive the process that ran it
+curl -s "$API/tasks/$id" -H "Authorization: Bearer $ANALYST" | jq .status
+# "completed"            <- task and audit history outlived the process that ran it
 ```
 
 Three deliberate choices in that compose file. The schema is a one-shot job
 rather than application startup, so the service never holds DDL privileges and a
-migration tool can replace the job without the API changing. The API waits on
-the database's healthcheck and on that job exiting 0, because an API that starts
+migration tool can replace the job without the API changing. The API waits on the
+database's healthcheck *and* on that job exiting 0, because an API that starts
 before its table exists fails its first request instead of its boot. And the
-database port is published, so the repository contract tests can be pointed at
-it:
-
-```bash
-EAP_TEST_DATABASE_URL=postgresql://eap:eap@localhost:5432/eap \
-  pytest -v tests/test_task_repository.py
-```
+database port is published, so the storage contract suite can be pointed at it.
 
 The compose deployment is a demo, not a production template: its tokens are
 published here, its model backend is scripted, and its tools move fictional
 money. `EAP_ENVIRONMENT=production` refuses all of it, and additionally refuses
 to boot with no credentials configured.
 
-## Roadmap
+## API
 
-1. **Foundation** — service skeleton, config, logging, tests, CI ✅
-2. **Core domain** — task lifecycle, repository port, task API, request
-   correlation IDs ✅
-3. **AI capability** — LLM provider abstraction, agent orchestration, tool
-   calling, MCP integration ✅
-4. **Human-in-the-loop** — approval workflows, structured state ✅
-5. **Persistence** — durable task store *(PostgreSQL adapter done; background
-   execution so a run survives a restart is next)*
-6. **Evaluation** — agent evaluation harness and metrics
-7. **Observability** — tracing, latency/cost accounting (OpenTelemetry)
-8. **Reliability & security** — *(bearer-token authentication, scopes, and
-   separation of duties on the approval gate done; retries, rate limits, and
-   prompt-injection defense beyond the current posture remain)*
-9. **Deployment** — *(Docker Compose for API + PostgreSQL done; cloud
-   infrastructure remains)*
+| Method & path | Scope | Result |
+| --- | --- | --- |
+| `GET /health` | none | 200; open, so probes need no credential |
+| `POST /tasks` | `tasks:write` | 201 pending task; the requester is the token's subject |
+| `GET /tasks` | `tasks:read` | Newest first; `status` filter, `limit` 1–200 |
+| `GET /tasks/{id}` | `tasks:read` | 200, or 404 |
+| `POST /tasks/{id}/run` | `tasks:write` | 200 with the run outcome; 409 if not pending |
+| `GET /tasks/{id}/approval` | `read`/`approve` | The held calls with their arguments and risk; 409 if not paused |
+| `POST /tasks/{id}/approve` | `tasks:approve` | 200 with the resumed run's outcome; **403 if the requester**; 409 if not paused or already decided |
+| `POST /tasks/{id}/reject` | `tasks:approve` | 200 cancelled task; the held calls never run |
+| `POST /tasks/{id}/cancel` | `tasks:write` | 200; 409 on a terminal task or a concurrent write |
+
+Closed routes answer 401 with `WWW-Authenticate: Bearer` when no credential is
+presented, and 403 with no challenge when the credential holds none of the scopes
+the route accepts. Every response carries `X-Request-ID`, and every log record
+written during that request carries both the ID and the authenticated subject —
+which call, and who made it.
+
+Full reference, curl walkthrough and every configuration variable:
+**[docs/API.md](docs/API.md)**.
+
+## Testing and quality
+
+```bash
+ruff check . && ruff format --check .   # lint and formatting
+mypy                                   # strict, over source and tests
+pytest                                 # 291 tests, all offline
+```
+
+CI runs those on Python 3.12 and 3.13, then the storage contract suite against a
+`postgres:17` service container, then a job that starts the compose stack and
+drives create → run → refused approval → approval → restart → still `completed`.
+
+The PostgreSQL parameters of the contract suite skip locally unless a database is
+named:
+
+```bash
+EAP_TEST_DATABASE_URL=postgresql://eap:eap@localhost:5432/eap \
+  pytest -v tests/test_task_repository.py
+```
+
+## Documentation
+
+| | |
+| --- | --- |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Problem statement, module map, task state machine, and the full design-decision record — including the authentication model and the MCP risk policy. The engineering argument behind every choice made here. |
+| **[docs/API.md](docs/API.md)** | Endpoint reference with curl examples, correlation IDs in logs, and the complete configuration table. |
+| **[.env.example](.env.example)** | Every setting, documented in place. |
 
 ## Limitations
 
-Agent runs execute inside the API process while the caller waits, so a long run
-holds an HTTP connection and a restart loses the run itself — the task and its
-checkpoint now survive, but the in-flight execution does not, so a run
-interrupted mid-flight stays `running` with nothing driving it. Moving execution
-behind a queue is the next milestone. Authentication is bearer tokens issued by
-configuration: there is no user store, no token rotation or revocation beyond
-editing `EAP_API_CLIENTS` and restarting, no per-task ownership (any subject with
-`tasks:read` can read any task, and any subject with `tasks:approve` can approve
-any task they did not request), and no rate limiting — it is the layer an OIDC or
-JWT verifier replaces, not an IAM system. No tools ship with the platform for real use — a deployment registers its
-own — so an out-of-the-box run offers the agent nothing unless `EAP_DEMO_TOOLS`
-turns on the synthetic demo set, whose data is entirely fictional and whose
-payments move nothing. The adapter is tested against a mock
-HTTP transport rather than the live API, and does not cover streaming or prompt
-caching. The PostgreSQL adapter is exercised by the contract suite in CI but has
-no migration tool behind it yet, and the default store is still in-memory, which
-is per-process and lost on restart. The MCP client speaks stdio only — HTTP and
-SSE transports are not implemented, though they are a second adapter behind the
-same port rather than a change to the client — and tools are discovered once at
-startup, so a server that gains or loses a tool while the process runs is not
-noticed until a restart.
+Stated plainly, because a system's known edges are part of its design.
+
+- **Runs are synchronous and in-process.** The caller waits, and a restart
+  mid-run leaves a `running` task with nothing driving it — the task and its
+  checkpoint survive, the in-flight execution does not. Moving execution behind a
+  queue with a lease and a sweeper is the clearest next step, and it is a change
+  to the entrypoint rather than to the domain, because progress is already
+  recorded on the task instead of in the response.
+- **Authentication is static bearer tokens issued by configuration.** No user
+  store, no rotation or revocation beyond editing `EAP_API_CLIENTS` and
+  restarting, no per-task ownership (any subject with `tasks:read` can read any
+  task; any subject with `tasks:approve` can approve any task they did not
+  request), and no rate limiting. It is the layer an OIDC or JWT verifier
+  replaces — one module, because routes depend on `Principal` — not an IAM
+  system.
+- **No evaluation harness.** Nothing here measures the quality of agent output:
+  no scored task suite, no LLM-judge, no regression baseline. Deliberately
+  deferred rather than half-built — evaluation deserves its own repository rather
+  than a ninth milestone in this one.
+- **Observability is structured logs, not traces.** JSON to stdout with
+  correlation IDs carried into work that outlives the request, plus per-run steps,
+  tool calls, token totals and latency. There is no OpenTelemetry, no distributed
+  tracing, and no cost accounting beyond those raw token counts.
+- **No tools ship for real use.** A deployment registers its own or points
+  `EAP_MCP_SERVERS` at a server. `EAP_DEMO_TOOLS=true` turns on the synthetic
+  accounts-payable set, whose data is fictional and whose payments move nothing.
+- **The model adapter has met a mock transport, not the live API**, and does not
+  implement streaming, prompt caching or thinking blocks.
+- **The MCP client speaks stdio only.** HTTP and SSE would be a second adapter
+  behind the same transport port, not a change to the client. Tools are discovered
+  once at startup, so a server that gains or loses a tool mid-process is not
+  noticed until a restart.
+- **No migration tool.** The schema is idempotent DDL behind
+  `python -m enterprise_agent_platform.tasks.postgres` — correct for one table,
+  and exactly where Alembic would go.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
